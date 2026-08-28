@@ -325,7 +325,7 @@ mod sig_test {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let mut dir = std::env::temp_dir();
-            dir.push(format!("rustdesk_sig_test_{}_{}", tag, nanos));
+            dir.push(format!("telemost_sig_test_{}_{}", tag, nanos));
             fs::create_dir_all(&dir).unwrap();
             TmpDir(dir)
         }

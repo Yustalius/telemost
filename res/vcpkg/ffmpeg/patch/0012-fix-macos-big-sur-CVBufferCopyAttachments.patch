@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: RustDesk <support@rustdesk.com>
+From: Telemost <support@rustdesk.com>
 Date: Fri, 1 Nov 2025 08:00:00 +0000
 Subject: [PATCH] Fix CVBufferCopyAttachments crash on macOS Big Sur
 

@@ -1,0 +1,12 @@
+# Диагностика совместимости с self-hosted hbbs: протокол + проверка ключа.
+# Не входит в workspace основного проекта, собирается отдельно:
+#   cd tools/rzcheck && cargo run
+[package]
+name = "rzcheck"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+hbb_common = { path = "../../libs/hbb_common" }

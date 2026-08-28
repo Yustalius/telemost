@@ -1,4 +1,4 @@
-name: Build the flutter version of the RustDesk
+name: Build the flutter version of the Telemost
 
 on:
   workflow_call:
@@ -14,7 +14,7 @@ on:
 # variables from this workflow!
 #
 # It does NOT read build steps, however, so please fix 'flutter/build_fdroid.sh
-# whenever you add changes to Android CI build action ('build-rustdesk-android')
+# whenever you add changes to Android CI build action ('build-telemost-android')
 # in this file!
 
 env:
@@ -30,7 +30,7 @@ env:
   # Windows arm64 only: the first stable Flutter to ship a native arm64 Windows Dart SDK +
   # engine is 3.44. Every other platform stays on FLUTTER_VERSION (3.24.5) until Windows 7
   # support is restored after the upstream-wide Flutter bump. The arm64 job patches the few
-  # 3.44-only source/pubspec changes on the fly (see "Patch RustDesk sources for Flutter 3.44").
+  # 3.44-only source/pubspec changes on the fly (see "Patch Telemost sources for Flutter 3.44").
   FLUTTER_WINDOWS_ARM_VERSION: "3.44.8"
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
@@ -70,7 +70,7 @@ jobs:
       - name: Generate SBOM
         run: |
           syft dir:. \
-            -o cyclonedx-json=rustdesk.sbom.json
+            -o cyclonedx-json=telemost.sbom.json
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -79,12 +79,12 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            rustdesk.sbom.json
+            telemost.sbom.json
 
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
 
-  build-RustDeskTempTopMostWindow:
+  build-TelemostTempTopMostWindow:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     strategy:
       fail-fast: false
@@ -107,7 +107,7 @@ jobs:
 
   build-for-windows-flutter:
     name: ${{ matrix.job.target }}
-    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    needs: [build-TelemostTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -205,9 +205,9 @@ jobs:
           }
 
       # https://github.com/flutter/flutter/issues/155685
-      # x64 only: arm64 uses the stock native arm64 Windows engine, and the rustdesk/engine
+      # x64 only: arm64 uses the stock native arm64 Windows engine, and the telemost/engine
       # windows-x64-release.zip is built for the 3.24-era x64 engine (matches FLUTTER_VERSION).
-      - name: Replace engine with rustdesk custom flutter engine
+      - name: Replace engine with telemost custom flutter engine
         if: ${{ matrix.job.arch == 'x86_64' }}
         run: |
           flutter doctor -v
@@ -228,7 +228,7 @@ jobs:
             git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
           fi
 
-      - name: Patch RustDesk sources for Flutter 3.44 (arm64)
+      - name: Patch Telemost sources for Flutter 3.44 (arm64)
         # arm64 is the only target on Flutter 3.44; apply its source/pubspec deltas on the fly
         # (shared with the 3.44 bridge job) so the committed sources stay on Flutter 3.24.5.
         # `flutter build` then runs `pub get`, regenerating pubspec.lock for the bumped deps.
@@ -281,40 +281,40 @@ jobs:
         shell: bash
         run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
 
-      - name: Build rustdesk
+      - name: Build telemost
         run: |
-          # Windows: build RustDesk
+          # Windows: build Telemost
           # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
           python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
-          mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
+          mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./telemost
 
-          # Download usbmmidd_v2.zip and extract it to ./rustdesk
+          # Download usbmmidd_v2.zip and extract it to ./telemost
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
           Remove-Item -Path usbmmidd_v2\Win32 -Recurse
           Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
-          mv -Force .\usbmmidd_v2 ./rustdesk
+          mv -Force .\usbmmidd_v2 ./telemost
 
-          # Download printer driver files and extract them to ./rustdesk
+          # Download printer driver files and extract them to ./telemost
           try {
-            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile telemost_printer_driver_v4-1.4.zip
             Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
             Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
 
             # Check and move the files
-            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
-            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*telemost_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path telemost_printer_driver_v4-1.4.zip -Algorithm SHA256
             $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
             $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
             if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
-                Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
-                Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
-                mkdir ./rustdesk/drivers
-                mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+                Write-Output "telemost_printer_driver_v4-1.4, checksums match, extract the file."
+                Expand-Archive telemost_printer_driver_v4-1.4.zip -DestinationPath .
+                mkdir ./telemost/drivers
+                mv -Force .\telemost_printer_driver_v4-1.4 ./telemost/drivers/TelemostPrinterDriver
                 Expand-Archive printer_driver_adapter.zip -DestinationPath .
-                mv -Force .\printer_driver_adapter.dll ./rustdesk
+                mv -Force .\printer_driver_adapter.dll ./telemost
             } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
-                Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
+                Write-Output "telemost_printer_driver_v4-1.4, checksums do not match, ignore the file."
             } else {
                 Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
             }
@@ -338,26 +338,26 @@ jobs:
             ls -l ./libs/portable/Runner.res;
           fi
 
-      - name: Download RustDeskTempTopMostWindow artifacts
+      - name: Download TelemostTempTopMostWindow artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ inputs.upload-artifact }}
         with:
           name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
-          path: "./rustdesk"
+          path: "./telemost"
 
       - name: Upload unsigned
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
-          path: rustdesk
+          name: telemost-unsigned-windows-${{ matrix.job.arch }}
+          path: telemost
 
-      - name: Sign rustdesk files
+      - name: Sign telemost files
         if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
         shell: bash
         run: |
           pip3 install requests argparse
-          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./rustdesk/
+          BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./telemost/
 
       - name: Build self-extracted executable
         shell: bash
@@ -366,10 +366,10 @@ jobs:
           sed -i '/dpiAware/d' res/manifest.xml
           pushd ./libs/portable
           pip3 install -r requirements.txt
-          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          python3 ./generate.py -f ../../telemost/ -o . -e ../../telemost/telemost.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+          mv ./target/release/telemost-portable-packer.exe ./SignOutput/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
@@ -381,15 +381,15 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           pushd ./res/msi
-          python preprocess.py --arp -d ../../rustdesk
+          python preprocess.py --arp -d ../../telemost
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
           $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
-          mv $msi.FullName ../../SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
-          sha256sum ../../SignOutput/rustdesk-*.msi
+          mv $msi.FullName ../../SignOutput/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+          sha256sum ../../SignOutput/telemost-*.msi
 
-      - name: Sign rustdesk self-extracted file
+      - name: Sign telemost self-extracted file
         if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
         shell: bash
         run: |
@@ -402,8 +402,8 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            ./SignOutput/rustdesk-*.msi
-            ./SignOutput/rustdesk-*.exe
+            ./SignOutput/telemost-*.msi
+            ./SignOutput/telemost-*.exe
 
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
   build-for-windows-sciter:
@@ -480,7 +480,7 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
         shell: bash
 
-      - name: Build rustdesk
+      - name: Build telemost
         id: build
         shell: bash
         run: |
@@ -490,7 +490,7 @@ jobs:
           cargo update -p sciter-rs --precise 674e07d3066ca9a92ced3816203ab6b652629d1e
           cargo build --locked --features inline,vram,hwcodec --release --bins
           mkdir -p ./Release
-          mv ./target/release/rustdesk.exe ./Release/rustdesk.exe
+          mv ./target/release/telemost.exe ./Release/telemost.exe
           curl -LJ -o ./Release/sciter.dll https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x32/sciter.dll
           echo "output_folder=./Release" >> $GITHUB_OUTPUT
           curl -LJ -o ./usbmmidd_v2.zip https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip
@@ -521,10 +521,10 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
+          name: telemost-unsigned-windows-${{ matrix.job.arch }}
           path: Release
 
-      - name: Sign rustdesk files
+      - name: Sign telemost files
         if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
         shell: bash
         run: |
@@ -537,12 +537,12 @@ jobs:
           sed -i '/dpiAware/d' res/manifest.xml
           pushd ./libs/portable
           pip3 install -r requirements.txt
-          python3 ./generate.py -f ../../Release/ -o . -e ../../Release/rustdesk.exe
+          python3 ./generate.py -f ../../Release/ -o . -e ../../Release/telemost.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
+          mv ./target/release/telemost-portable-packer.exe ./SignOutput/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.exe
 
-      - name: Sign rustdesk self-extracted file
+      - name: Sign telemost self-extracted file
         if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
         shell: bash
         run: |
@@ -555,11 +555,11 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            ./SignOutput/rustdesk-*.exe
+            ./SignOutput/telemost-*.exe
 
-  build-rustdesk-ios:
+  build-telemost-ios:
     if: ${{ inputs.upload-artifact }}
-    name: build rustdesk ios ipa
+    name: build telemost ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
     strategy:
@@ -634,7 +634,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          prefix-key: rustdesk-lib-cache-ios
+          prefix-key: telemost-lib-cache-ios
           key: ${{ matrix.job.target }}
 
       - name: Restore bridge files
@@ -643,18 +643,18 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      - name: Build rustdesk lib
+      - name: Build telemost lib
         run: |
           rustup target add ${{ matrix.job.target }}
           cargo build --locked --features flutter,hwcodec --release --target aarch64-apple-ios --lib
           
-      - name: Upload liblibrustdesk.a Artifacts
+      - name: Upload liblibtelemost.a Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: liblibrustdesk.a
-          path: target/aarch64-apple-ios/release/liblibrustdesk.a
+          name: liblibtelemost.a
+          path: target/aarch64-apple-ios/release/liblibtelemost.a
 
-      - name: Build rustdesk
+      - name: Build telemost
         shell: bash
         run: |
           pushd flutter
@@ -666,7 +666,7 @@ jobs:
       #   # if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
       #   uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       #   with:
-      #     name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+      #     name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
       #     path: flutter/build/ios/ipa/*.ipa
 
       # - name: Publish ipa package
@@ -721,12 +721,12 @@ jobs:
         with:
           p12-file-base64: ${{ secrets.MACOS_P12_BASE64 }}
           p12-password: ${{ secrets.MACOS_P12_PASSWORD }}
-          keychain: rustdesk
+          keychain: telemost
 
       - name: Check sign and import sign key
         if: env.MACOS_P12_BASE64 != null
         run: |
-          security default-keychain -s rustdesk.keychain
+          security default-keychain -s telemost.keychain
           security find-identity -v
 
       - name: Import notarize key
@@ -734,7 +734,7 @@ jobs:
         uses: timheuer/base64-to-file@adaa40c0c581f276132199d4cf60afa07ce60eac # v1.2
         with:
           # https://gregoryszorc.com/docs/apple-codesign/stable/apple_codesign_rcodesign.html#notarizing-and-stapling
-          fileName: rustdesk.json
+          fileName: telemost.json
           fileDir: ${{ github.workspace }}
           encodedString: ${{ secrets.MACOS_NOTARIZE_JSON }}
 
@@ -839,7 +839,7 @@ jobs:
           cargo -V
           rustc -V
 
-      - name: Build rustdesk
+      - name: Build telemost
         run: |
           if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
             MIN_MACOS_VERSION="12.3"
@@ -856,14 +856,14 @@ jobs:
           CREATE_DMG="$(command -v create-dmg)"
           CREATE_DMG="$(readlink -f "$CREATE_DMG")"
           sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
-          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+          create-dmg --icon "Telemost.app" 200 190 --hide-extension "Telemost.app" --window-size 800 400 --app-drop-link 600 185 telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg ./flutter/build/macos/Build/Products/Release/Telemost.app
 
       - name: Upload unsigned macOS app
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-unsigned-macos-${{ matrix.job.arch }}
-          path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg # can not upload the directory directly or tar.gz, which destroy the link structure, causing the codesign failed
+          name: telemost-unsigned-macos-${{ matrix.job.arch }}
+          path: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg # can not upload the directory directly or tar.gz, which destroy the link structure, causing the codesign failed
 
       - name: Codesign app and create signed dmg
         if: env.MACOS_P12_BASE64 != null && env.UPLOAD_ARTIFACT == 'true'
@@ -873,20 +873,20 @@ jobs:
           CREATE_DMG="$(readlink -f "$CREATE_DMG")"
           sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
           # Unlock keychain
-          security default-keychain -s rustdesk.keychain
-          security unlock-keychain -p ${{ secrets.MACOS_P12_PASSWORD }} rustdesk.keychain
-          # start sign the rustdesk.app and dmg
+          security default-keychain -s telemost.keychain
+          security unlock-keychain -p ${{ secrets.MACOS_P12_PASSWORD }} telemost.keychain
+          # start sign the telemost.app and dmg
           rm -rf *.dmg || true
-          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict ./flutter/build/macos/Build/Products/Release/RustDesk.app -vvv
-          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
-          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict rustdesk-${{ env.VERSION }}.dmg -vvv
-          # notarize the rustdesk-${{ env.VERSION }}.dmg
-          rcodesign notary-submit --api-key-path ${{ github.workspace }}/rustdesk.json  --staple rustdesk-${{ env.VERSION }}.dmg
+          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict ./flutter/build/macos/Build/Products/Release/Telemost.app -vvv
+          create-dmg --icon "Telemost.app" 200 190 --hide-extension "Telemost.app" --window-size 800 400 --app-drop-link 600 185 telemost-${{ env.VERSION }}.dmg ./flutter/build/macos/Build/Products/Release/Telemost.app
+          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict telemost-${{ env.VERSION }}.dmg -vvv
+          # notarize the telemost-${{ env.VERSION }}.dmg
+          rcodesign notary-submit --api-key-path ${{ github.workspace }}/telemost.json  --staple telemost-${{ env.VERSION }}.dmg
 
-      - name: Rename rustdesk
+      - name: Rename telemost
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
-          for name in rustdesk*??.dmg; do
+          for name in telemost*??.dmg; do
               mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
           done
 
@@ -897,7 +897,7 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            rustdesk*-${{ matrix.job.arch }}.dmg
+            telemost*-${{ matrix.job.arch }}.dmg
 
   publish_unsigned:
     needs:
@@ -910,41 +910,41 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-unsigned-macos-x86_64
+          name: telemost-unsigned-macos-x86_64
           path: ./
 
       - name: Download Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-unsigned-macos-aarch64
+          name: telemost-unsigned-macos-aarch64
           path: ./
 
       - name: Download Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-unsigned-windows-x86_64
+          name: telemost-unsigned-windows-x86_64
           path: ./windows-x86_64/
 
       - name: Download Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-unsigned-windows-x86
+          name: telemost-unsigned-windows-x86
           path: ./windows-x86/
 
       - name: Combine unsigned app
         run: |
-          tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-x86
+          tar czf telemost-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-x86
 
       - name: Publish unsigned app
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
-          files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
+          files: telemost-${{ env.VERSION }}-unsigned.tar.gz
 
-  build-rustdesk-android:
+  build-telemost-android:
     needs: [generate-bridge]
-    name: build rustdesk android apk ${{ matrix.job.target }}
+    name: build telemost android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -1097,10 +1097,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          prefix-key: rustdesk-lib-cache-android # TODO: drop '-android' part after caches are invalidated
+          prefix-key: telemost-lib-cache-android # TODO: drop '-android' part after caches are invalidated
           key: ${{ matrix.job.target }}
 
-      - name: Build rustdesk lib
+      - name: Build telemost lib
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -1111,32 +1111,32 @@ jobs:
             aarch64-linux-android)
               ./flutter/ndk_arm64.sh
               mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/libtelemost.so
             ;;
             armv7-linux-androideabi)
               ./flutter/ndk_arm.sh
               mkdir -p ./flutter/android/app/src/main/jniLibs/armeabi-v7a
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/libtelemost.so
             ;;
             x86_64-linux-android)
               ./flutter/ndk_x64.sh
               mkdir -p ./flutter/android/app/src/main/jniLibs/x86_64
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86_64/libtelemost.so
             ;;
             i686-linux-android)
               ./flutter/ndk_x86.sh
               mkdir -p ./flutter/android/app/src/main/jniLibs/x86
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86/libtelemost.so
             ;;
           esac
 
-      - name: Upload Rustdesk library to Artifacts
+      - name: Upload Telemost library to Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: librustdesk.so.${{ matrix.job.target }}
-          path: ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
+          name: libtelemost.so.${{ matrix.job.target }}
+          path: ./target/${{ matrix.job.target }}/release/liblibtelemost.so
 
-      - name: Build rustdesk
+      - name: Build telemost
         shell: bash
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
@@ -1150,43 +1150,43 @@ jobs:
             aarch64-linux-android)
               mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
               cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/libtelemost.so
               # build flutter
               pushd flutter
               flutter build apk "--${{ matrix.job.reltype }}" --target-platform android-arm64 --split-per-abi
-              mv build/app/outputs/flutter-apk/app-arm64-v8a-${{ matrix.job.reltype }}.apk ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
+              mv build/app/outputs/flutter-apk/app-arm64-v8a-${{ matrix.job.reltype }}.apk ../telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
             ;;
             armv7-linux-androideabi)
               mkdir -p ./flutter/android/app/src/main/jniLibs/armeabi-v7a
               cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/libtelemost.so
               # build flutter
               pushd flutter
               flutter build apk "--${{ matrix.job.reltype }}" --target-platform android-arm --split-per-abi
-              mv build/app/outputs/flutter-apk/app-armeabi-v7a-${{ matrix.job.reltype }}.apk ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
+              mv build/app/outputs/flutter-apk/app-armeabi-v7a-${{ matrix.job.reltype }}.apk ../telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
             ;;
             x86_64-linux-android)
               mkdir -p ./flutter/android/app/src/main/jniLibs/x86_64
               cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86_64/
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86_64/libtelemost.so
               # build flutter
               pushd flutter
               flutter build apk "--${{ matrix.job.reltype }}" --target-platform android-x64 --split-per-abi
-              mv build/app/outputs/flutter-apk/app-x86_64-${{ matrix.job.reltype }}.apk ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
+              mv build/app/outputs/flutter-apk/app-x86_64-${{ matrix.job.reltype }}.apk ../telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
             ;;
             i686-linux-android)
               mkdir -p ./flutter/android/app/src/main/jniLibs/x86
               cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86/
-              cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86/librustdesk.so
+              cp ./target/${{ matrix.job.target }}/release/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86/libtelemost.so
               # build flutter
               pushd flutter
               flutter build apk "--${{ matrix.job.reltype }}" --target-platform android-x86 --split-per-abi
-              mv build/app/outputs/flutter-apk/app-x86-${{ matrix.job.reltype }}.apk ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
+              mv build/app/outputs/flutter-apk/app-x86-${{ matrix.job.reltype }}.apk ../telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk
             ;;
           esac
           popd
           mkdir -p signed-apk; pushd signed-apk
-          mv ../rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk .
+          mv ../telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.apk .
 
       # https://github.com/r0adkll/sign-android-release/issues/84#issuecomment-1889636075
       - name: Setup sign tool version variable
@@ -1199,7 +1199,7 @@ jobs:
       - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # v1
         name: Sign app APK
         if: env.ANDROID_SIGNING_KEY != null
-        id: sign-rustdesk
+        id: sign-telemost
         with:
           releaseDirectory: ./signed-apk
           signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
@@ -1214,8 +1214,8 @@ jobs:
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
-          path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          path: ${{steps.sign-telemost.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
@@ -1224,7 +1224,7 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+            ${{steps.sign-telemost.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
         if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
@@ -1233,11 +1233,11 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+            signed-apk/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
 
-  build-rustdesk-android-universal:
-    needs: [build-rustdesk-android]
-    name: build rustdesk android universal apk
+  build-telemost-android-universal:
+    needs: [build-telemost-android]
+    name: build telemost android universal apk
     if: ${{ inputs.upload-artifact }}
     runs-on: ubuntu-24.04
     env:
@@ -1321,32 +1321,32 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      - name: Download Rustdesk library from Artifacts
+      - name: Download Telemost library from Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: librustdesk.so.aarch64-linux-android
+          name: libtelemost.so.aarch64-linux-android
           path: ./flutter/android/app/src/main/jniLibs/arm64-v8a
 
-      - name: Download Rustdesk library from Artifacts
+      - name: Download Telemost library from Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: librustdesk.so.armv7-linux-androideabi
+          name: libtelemost.so.armv7-linux-androideabi
           path: ./flutter/android/app/src/main/jniLibs/armeabi-v7a
 
-      - name: Download Rustdesk library from Artifacts
+      - name: Download Telemost library from Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: librustdesk.so.x86_64-linux-android
+          name: libtelemost.so.x86_64-linux-android
           path: ./flutter/android/app/src/main/jniLibs/x86_64
 
-      - name: Download Rustdesk library from Artifacts
+      - name: Download Telemost library from Artifacts
         if: ${{ env.reltype == 'debug' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: librustdesk.so.i686-linux-android
+          name: libtelemost.so.i686-linux-android
           path: ./flutter/android/app/src/main/jniLibs/x86
 
-      - name: Build rustdesk
+      - name: Build telemost
         shell: bash
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
@@ -1356,14 +1356,14 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           # temporary use debug sign config
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
-          mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/libtelemost.so
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
-          mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/libtelemost.so
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/
-          mv ./flutter/android/app/src/main/jniLibs/x86_64/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+          mv ./flutter/android/app/src/main/jniLibs/x86_64/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86_64/libtelemost.so
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86_64/
           if [ "${{ env.reltype }}" = "debug" ]; then
-            mv ./flutter/android/app/src/main/jniLibs/x86/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86/librustdesk.so
+            mv ./flutter/android/app/src/main/jniLibs/x86/liblibtelemost.so ./flutter/android/app/src/main/jniLibs/x86/libtelemost.so
             cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86/
           fi
           # build flutter
@@ -1371,7 +1371,7 @@ jobs:
           flutter build apk "--${{ env.reltype }}" --target-platform android-arm64,android-arm,android-x64${{ env.x86_target }}
           popd
           mkdir -p signed-apk
-          mv ./flutter/build/app/outputs/flutter-apk/app-${{ env.reltype }}.apk signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-${{ env.reltype }}.apk signed-apk/telemost-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
       # https://github.com/r0adkll/sign-android-release/issues/84#issuecomment-1889636075
       - name: Setup sign tool version variable
@@ -1384,7 +1384,7 @@ jobs:
       - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # v1
         name: Sign app APK
         if: env.ANDROID_SIGNING_KEY != null
-        id: sign-rustdesk
+        id: sign-telemost
         with:
           releaseDirectory: ./signed-apk
           signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
@@ -1399,8 +1399,8 @@ jobs:
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
-          path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          path: ${{steps.sign-telemost.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
@@ -1409,7 +1409,7 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+            ${{steps.sign-telemost.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
         if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
@@ -1418,11 +1418,11 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
+            signed-apk/telemost-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
-  build-rustdesk-linux:
+  build-telemost-linux:
     needs: [generate-bridge]
-    name: build rustdesk linux ${{ matrix.job.target }}
+    name: build telemost linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
     strategy:
       fail-fast: false
@@ -1541,7 +1541,7 @@ jobs:
           path: ./
 
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
-        name: Build rustdesk
+        name: Build telemost
         id: vcpkg
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
         with:
@@ -1679,7 +1679,7 @@ jobs:
             export CARGO_INCREMENTAL=0
             export DEB_ARCH=${{ matrix.job.deb_arch }}
             python3 ./build.py --flutter --skip-cargo
-            for name in rustdesk*??.deb; do
+            for name in telemost*??.deb; do
               mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
             done
 
@@ -1693,7 +1693,7 @@ jobs:
             esac
             HBB=`pwd` rpmbuild ./res/rpm-flutter.spec -bb
             pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
-            for name in rustdesk*??.rpm; do
+            for name in telemost*??.rpm; do
                 mv "$name" /workspace/"${name%%.rpm}.rpm"
             done
 
@@ -1707,7 +1707,7 @@ jobs:
             esac
             HBB=`pwd` rpmbuild ./res/rpm-flutter-suse.spec -bb
             pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
-            for name in rustdesk*??.rpm; do
+            for name in telemost*??.rpm; do
                 mv "$name" /workspace/"${name%%.rpm}-suse.rpm"
             done
 
@@ -1718,15 +1718,15 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            rustdesk-*.deb
-            rustdesk-*.rpm
+            telemost-*.deb
+            telemost-*.rpm
 
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: env.UPLOAD_ARTIFACT == 'true'
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
-          path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+          path: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
 
       # only x86_64 for arch since we can not find newest arm64 docker image to build
       # old arch image does not make sense for arch since it is "arch" which always update to date
@@ -1754,16 +1754,16 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            res/rustdesk-${{ env.VERSION }}*.zst
+            res/telemost-${{ env.VERSION }}*.zst
 
-  # Same build as build-rustdesk-linux x86_64 -- same vcpkg/ffmpeg, same ubuntu18.04 container, same
+  # Same build as build-telemost-linux x86_64 -- same vcpkg/ffmpeg, same ubuntu18.04 container, same
   # rust and flutter -- only with the drm feature on, so it ships as the separate
-  # rustdesk-unattended-wayland deb. libdrmtap is built on the runner because bionic's meson is too
-  # old for it. A separate job rather than a matrix entry of build-rustdesk-linux: appimage and
+  # telemost-unattended-wayland deb. libdrmtap is built on the runner because bionic's meson is too
+  # old for it. A separate job rather than a matrix entry of build-telemost-linux: appimage and
   # flatpak need that job, and a failure here must not skip them.
-  build-rustdesk-linux-drm:
+  build-telemost-linux-drm:
     needs: [generate-bridge]
-    name: build rustdesk linux drm x86_64
+    name: build telemost linux drm x86_64
     runs-on: ubuntu-22.04
     steps:
       - name: Export GitHub Actions cache environment variables
@@ -1863,7 +1863,7 @@ jobs:
         shell: bash
 
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
-        name: Build rustdesk
+        name: Build telemost
         id: vcpkg
         with:
           arch: x86_64
@@ -1971,7 +1971,7 @@ jobs:
             export CARGO_INCREMENTAL=0
             export DEB_ARCH=amd64
             python3 ./build.py --flutter --drm --hwcodec --unix-file-copy-paste --skip-cargo
-            for name in rustdesk*??.deb; do
+            for name in telemost*??.deb; do
               mv "$name" "${name%%.deb}-x86_64.deb"
             done
 
@@ -1984,24 +1984,24 @@ jobs:
           # Resolve by glob, not from env.VERSION: build.py names the deb from Cargo.toml, so a
           # hardcoded name fails with a bare exit 1 the first time those two drift.
           shopt -s nullglob
-          debs=(rustdesk-unattended-wayland-*-x86_64.deb)
+          debs=(telemost-unattended-wayland-*-x86_64.deb)
           if [ "${#debs[@]}" -ne 1 ]; then
-            echo "::error::expected one rustdesk-unattended-wayland-*-x86_64.deb, found ${#debs[@]}: ${debs[*]-none}"
+            echo "::error::expected one telemost-unattended-wayland-*-x86_64.deb, found ${#debs[@]}: ${debs[*]-none}"
             exit 1
           fi
           deb="${debs[0]}"
           echo "DRM_DEB=$deb" >> "$GITHUB_ENV"
           contents="$(dpkg -c "$deb")"
-          if [[ ! "$contents" =~ usr/lib/rustdesk/libdrmtap\.so\.0\.[0-9]+\.[0-9]+ ]]; then
+          if [[ ! "$contents" =~ usr/lib/telemost/libdrmtap\.so\.0\.[0-9]+\.[0-9]+ ]]; then
             echo "::error::$deb has no versioned libdrmtap.so.0.x.y"
             exit 1
           fi
-          if [[ "$contents" != *"usr/lib/rustdesk/libdrmtap.so.0 ->"* ]]; then
+          if [[ "$contents" != *"usr/lib/telemost/libdrmtap.so.0 ->"* ]]; then
             echo "::error::$deb has no libdrmtap.so.0 soname symlink"
             exit 1
           fi
           rm -rf /tmp/deb && dpkg-deb -R "$deb" /tmp/deb
-          if ! grep -qF /usr/lib/rustdesk/libdrmtap.so.0 /tmp/deb/usr/share/rustdesk/lib/librustdesk.so; then
+          if ! grep -qF /usr/lib/telemost/libdrmtap.so.0 /tmp/deb/usr/share/telemost/lib/libtelemost.so; then
             echo "::error::$deb was not built with the drm feature"
             exit 1
           fi
@@ -2025,10 +2025,10 @@ jobs:
           name: ${{ env.DRM_DEB }}
           path: ${{ env.DRM_DEB }}
 
-  build-rustdesk-linux-sciter:
+  build-telemost-linux-sciter:
     if: ${{ inputs.upload-artifact }}
     runs-on: ${{ matrix.job.on }}
-    name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
+    name: build-telemost-linux-sciter ${{ matrix.job.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -2048,7 +2048,7 @@ jobs:
               arch: armv7,
               target: armv7-unknown-linux-gnueabihf,
               on: ubuntu-22.04-arm,
-              distro: ubuntu18.04-rustdesk,
+              distro: ubuntu18.04-telemost,
               deb_arch: armhf,
               sciter_arch: arm32,
               vcpkg-triplet: arm-linux,
@@ -2093,7 +2093,7 @@ jobs:
           echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_ENV
 
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
-        name: Build rustdesk sciter binary for ${{ matrix.job.arch }}
+        name: Build telemost sciter binary for ${{ matrix.job.arch }}
         id: vcpkg
         with:
           arch: ${{ matrix.job.arch }}
@@ -2216,21 +2216,21 @@ jobs:
               exit 1
             fi
             head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
-            # build rustdesk
+            # build telemost
             python3 ./res/inline-sciter.py
             export CARGO_INCREMENTAL=0
             cargo build --locked --features inline${{ matrix.job.extra_features }} --release --bins --jobs 1
             # make debian package
             mkdir -p ./Release
-            mv ./target/release/rustdesk ./Release/rustdesk
+            mv ./target/release/telemost ./Release/telemost
             wget -O ./Release/libsciter-gtk.so https://github.com/c-smile/sciter-sdk/raw/master/bin.lnx/${{ matrix.job.sciter_arch }}/libsciter-gtk.so
             export DEB_ARCH=${{ matrix.job.deb_arch }}
             ./build.py --package ./Release
 
-      - name: Rename rustdesk
+      - name: Rename telemost
         shell: bash
         run: |
-          for name in rustdesk*??.deb; do
+          for name in telemost*??.deb; do
               # use cp to duplicate deb files to fit other packages.
               cp "$name" "${name%%.deb}-${{ matrix.job.arch }}-sciter.deb"
           done
@@ -2242,18 +2242,18 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
+            telemost-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
 
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: env.UPLOAD_ARTIFACT == 'true'
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
-          path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
+          path: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
 
   build-appimage:
     name: Build appimage ${{ matrix.job.target }}
-    needs: [build-rustdesk-linux]
+    needs: [build-telemost-linux]
     runs-on: ubuntu-22.04
     if: ${{ inputs.upload-artifact }}
     strategy:
@@ -2271,12 +2271,12 @@ jobs:
       - name: Download Binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
           path: .
 
       - name: Rename Binary
         run: |
-          mv rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb appimage/rustdesk.deb
+          mv telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.deb appimage/telemost.deb
 
       - name: Build appimage package
         shell: bash
@@ -2300,13 +2300,13 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            ./appimage/rustdesk-${{ env.VERSION }}-*.AppImage
+            ./appimage/telemost-${{ env.VERSION }}-*.AppImage
 
   build-flatpak:
     name: Build flatpak ${{ matrix.job.target }}${{ matrix.job.suffix }}
     needs:
-      - build-rustdesk-linux
-      - build-rustdesk-linux-sciter
+      - build-telemost-linux
+      - build-telemost-linux-sciter
     runs-on: ${{ matrix.job.on }}
     if: ${{ inputs.upload-artifact }}
     strategy:
@@ -2345,15 +2345,15 @@ jobs:
       - name: Download Binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.deb
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.deb
           path: .
 
       - name: Rename Binary
         run: |
-          mv rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.deb flatpak/rustdesk.deb
+          mv telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.deb flatpak/telemost.deb
 
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
-        name: Build rustdesk flatpak package for ${{ matrix.job.arch }}
+        name: Build telemost flatpak package for ${{ matrix.job.arch }}
         id: flatpak
         with:
           arch: ${{ matrix.job.arch }}
@@ -2376,8 +2376,8 @@ jobs:
             # package
             pushd flatpak
             git clone https://github.com/flathub/shared-modules.git --depth=1
-            flatpak-builder --user --install-deps-from=flathub -y --force-clean --repo=repo ./build ./rustdesk.json
-            flatpak build-bundle ./repo rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak com.rustdesk.RustDesk
+            flatpak-builder --user --install-deps-from=flathub -y --force-clean --repo=repo ./build ./telemost.json
+            flatpak build-bundle ./repo telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak com.telemost.Telemost
 
       - name: Publish flatpak package
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -2385,11 +2385,11 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            flatpak/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
+            flatpak/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
 
-  build-rustdesk-web:
+  build-telemost-web:
     if: False
-    name: build-rustdesk-web
+    name: build-telemost-web
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -2457,7 +2457,7 @@ jobs:
           cp ../web/README.md web
           # TODO: Remove the following line when the web is almost complete.
           echo -e "\n\nThis build is for preview and not full functionality." >> web/README.md
-          dir_name="rustdesk-${{ env.VERSION }}-${{ env.RELEASE_NAME }}"
+          dir_name="telemost-${{ env.VERSION }}-${{ env.RELEASE_NAME }}"
           mv web "${dir_name}" && tar czf "${dir_name}".tar.gz "${dir_name}"
           sha256sum "${dir_name}".tar.gz
           popd
@@ -2469,4 +2469,4 @@ jobs:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            flutter/build/rustdesk-${{ env.VERSION }}-${{ env.RELEASE_NAME }}.tar.gz
+            flutter/build/telemost-${{ env.VERSION }}-${{ env.RELEASE_NAME }}.tar.gz

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Telemost
+NoDisplay=true
+MimeType=x-scheme-handler/telemost;
+TryExec=telemost
+Exec=telemost %u
+Icon=telemost
+Terminal=false
+Type=Application
+StartupNotify=false
+StartupWMClass=telemost

@@ -305,7 +305,7 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
 
 // The desktop rect and per-display logical rects, read live from the compositor in a single
 // roundtrip (drm builds may skip a turn during the failure backoff). Skips the displays cache
-// and the primary-monitor detection, cheap enough to poll. rustdesk/rustdesk#15601
+// and the primary-monitor detection, cheap enough to poll. telemost/telemost#15601
 pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<DisplayRect>)> {
     #[cfg(feature = "drm")]
     if backed_off() {

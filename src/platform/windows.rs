@@ -1254,8 +1254,8 @@ pub fn portable_service_logon_helper_paths() -> Option<(PathBuf, PathBuf)> {
         .home_dir()
         .join("AppData")
         .join("Local")
-        .join("rustdesk-sciter");
-    let dst = dir.join("rustdesk.exe");
+        .join("telemost-sciter");
+    let dst = dir.join("telemost.exe");
     Some((dir, dst))
 }
 
@@ -1633,7 +1633,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     }
     // The elevated runner expands this to `%~f0.dir`, beside its protected copy.
     // Do not stage privileged shortcut artifacts in the user-writable `%TEMP%`.
-    let tmp_path = "%RUSTDESK_OUTPUT_DIR%".to_owned();
+    let tmp_path = "%TELEMOST_OUTPUT_DIR%".to_owned();
     let mk_shortcut_commands = embedded_shortcut_commands(
         shortcut_bytes(&exe, None, shortcut_icon_location.as_deref())?,
         &format!("{app_name}.lnk"),
@@ -1967,8 +1967,8 @@ fn get_public_base_dir() -> PathBuf {
 #[inline]
 pub fn get_custom_client_staging_dir() -> PathBuf {
     get_public_base_dir()
-        .join("RustDesk")
-        .join("RustDeskCustomClientStaging")
+        .join("Telemost")
+        .join("TelemostCustomClientStaging")
 }
 
 /// Removes the custom client staging directory.
@@ -1977,7 +1977,7 @@ pub fn get_custom_client_staging_dir() -> PathBuf {
 ///
 /// Rationale
 /// - The staging directory only contains a small `custom.txt`, leaving it is harmless.
-/// - Deleting directories under a public location (e.g., C:\\ProgramData\\RustDesk) is
+/// - Deleting directories under a public location (e.g., C:\\ProgramData\\Telemost) is
 ///   susceptible to TOCTOU attacks if an unprivileged user can replace the path with a
 ///   symlink/junction between checks and deletion.
 ///
@@ -2149,7 +2149,7 @@ pub fn bootstrap() -> bool {
     }
     #[cfg(not(debug_assertions))]
     {
-        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging RustDesk.
+        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging Telemost.
         // Only call set_safe_load_dll() on Windows 10 or greater
         if is_win_10_or_greater() {
             set_safe_load_dll()
@@ -3119,11 +3119,11 @@ mod cert {
     use hbb_common::ResultType;
 
     extern "C" {
-        fn DeleteRustDeskTestCertsW();
+        fn DeleteTelemostTestCertsW();
     }
     pub fn uninstall_cert() -> ResultType<()> {
         unsafe {
-            DeleteRustDeskTestCertsW();
+            DeleteTelemostTestCertsW();
         }
         Ok(())
     }
@@ -3228,7 +3228,7 @@ impl Drop for WakeLock {
 // and every miss spawns one more tray icon.
 //
 // The case confirmed in #15689: `run_after_run_cmds()` spawns the tray in the
-// caller's own context, so installing or toggling the service from a RustDesk
+// caller's own context, so installing or toggling the service from a Telemost
 // that was itself started elevated leaves a high integrity tray behind. A main
 // window started normally afterwards runs at medium integrity and cannot open
 // that process with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`. sysinfo then
@@ -3330,7 +3330,7 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
 chcp 65001
 taskkill /F /IM {app_name}.exe{filter}
 {tray_shortcut_commands}
-copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+copy /Y \"%TELEMOST_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
 {create_service}
     ",
@@ -3542,7 +3542,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // md \"{path}\"
     //
     // We need `taskkill` because:
-    // 1. There may be some other processes like `rustdesk --connect` are running.
+    // 1. There may be some other processes like `telemost --connect` are running.
     // 2. Sometimes, the main window and the tray icon are showing
     // while I cannot find them by `tasklist` or the methods above.
     // There's should be 4 processes running: service, server, tray and main window.
@@ -3642,12 +3642,12 @@ fn normalize_msi_product_code(value: &str) -> Option<String> {
 
 fn build_msi_uninstall_command(product_code: &str) -> String {
     format!(
-        "set \"RUSTDESK_MSI_EXIT_CODE=\"\n\
+        "set \"TELEMOST_MSI_EXIT_CODE=\"\n\
 MsiExec.exe /X {product_code} /norestart REBOOT=ReallySuppress\n\
-set \"RUSTDESK_MSI_EXIT_CODE=%ERRORLEVEL%\"\n\
-if \"%RUSTDESK_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_REQUIRED}\" echo MSI uninstall succeeded with a reboot recommendation; continuing without reboot.\n\
-if \"%RUSTDESK_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_INITIATED}\" echo MSI uninstall succeeded with a reboot request; continuing without forcing reboot.\n\
-if not \"%RUSTDESK_MSI_EXIT_CODE%\"==\"0\" if not \"%RUSTDESK_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_REQUIRED}\" if not \"%RUSTDESK_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_INITIATED}\" exit /b %RUSTDESK_MSI_EXIT_CODE%\n\
+set \"TELEMOST_MSI_EXIT_CODE=%ERRORLEVEL%\"\n\
+if \"%TELEMOST_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_REQUIRED}\" echo MSI uninstall succeeded with a reboot recommendation; continuing without reboot.\n\
+if \"%TELEMOST_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_INITIATED}\" echo MSI uninstall succeeded with a reboot request; continuing without forcing reboot.\n\
+if not \"%TELEMOST_MSI_EXIT_CODE%\"==\"0\" if not \"%TELEMOST_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_REQUIRED}\" if not \"%TELEMOST_MSI_EXIT_CODE%\"==\"{MSI_EXIT_SUCCESS_REBOOT_INITIATED}\" exit /b %TELEMOST_MSI_EXIT_CODE%\n\
 ver > nul"
     )
 }
@@ -3984,8 +3984,8 @@ pub fn try_remove_temp_update_files() {
         if let Ok(entry) = entry {
             let path = entry.path();
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match files like rustdesk-*.msi or rustdesk-*.exe
-                if file_name.starts_with("rustdesk-")
+                // Match files like telemost-*.msi or telemost-*.exe
+                if file_name.starts_with("telemost-")
                     && (file_name.ends_with(".msi") || file_name.ends_with(".exe"))
                 {
                     // Skip files modified within the last hour to avoid deleting files being downloaded
@@ -4051,7 +4051,7 @@ pub fn message_box(text: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
-    let caption = "RustDesk Output"
+    let caption = "Telemost Output"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
@@ -4189,8 +4189,8 @@ pub fn release_arch_suffix() -> Option<&'static str> {
     }
 }
 
-pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
-    // Kill rustdesk.exe without extra arg, should only be called by --server
+pub fn try_kill_telemost_main_window_process() -> ResultType<()> {
+    // Kill telemost.exe without extra arg, should only be called by --server
     // We can find the exact process which occupies the ipc, see more from https://github.com/winsiderss/systeminformer
     let app_name = crate::get_app_name().to_lowercase();
     log::info!("try kill main window process");
@@ -4238,7 +4238,7 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
         log::info!("kill process success: {:?}, pid = {:?}", p.cmd(), p.pid());
         return Ok(());
     }
-    bail!("failed to find rustdesk main window process");
+    bail!("failed to find telemost main window process");
 }
 
 fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
@@ -4502,7 +4502,7 @@ pub fn send_raw_data_to_printer(printer_name: Option<String>, data: Vec<u8>) -> 
             data.len() as c_ulong,
         );
         if res != 0 {
-            bail!("Failed to send data to the printer, see logs in C:\\Windows\\temp\\test_rustdesk.log for more details.");
+            bail!("Failed to send data to the printer, see logs in C:\\Windows\\temp\\test_telemost.log for more details.");
         } else {
             log::info!("Successfully sent data to the printer");
         }
@@ -4612,10 +4612,10 @@ fn get_pids_with_args_from_wmic_output<S2: AsRef<str>>(
     // CommandLine=
     // ProcessId=34668
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe" --tray
+    // CommandLine="C:\Program Files\Telemost\Telemost.exe" --tray
     // ProcessId=13728
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe"
+    // CommandLine="C:\Program Files\Telemost\Telemost.exe"
     // ProcessId=10136
     let mut pids = Vec::new();
     let mut proc_found = false;
@@ -4846,8 +4846,8 @@ mod tests {
 
     #[test]
     fn install_app_names_enforce_ascii_command_safety() {
-        assert!(validate_install_app_name("RustDesk-Admin1").is_ok());
-        for app_name in ["", "RustDesk_Admin", "RustDesk&whoami", "RustDesk应用"] {
+        assert!(validate_install_app_name("Telemost-Admin1").is_ok());
+        for app_name in ["", "Telemost_Admin", "Telemost&whoami", "Telemost应用"] {
             assert!(
                 validate_install_app_name(app_name).is_err(),
                 "unsafe application name was accepted: {app_name}"

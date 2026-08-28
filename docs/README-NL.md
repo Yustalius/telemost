@@ -1,21 +1,21 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Uw bureaublad op afstand"><br>
+  <img src="../res/logo-header.svg" alt="Telemost - Uw bureaublad op afstand"><br>
   <a href="#free-public-servers">Servers</a> •
   <a href="#raw-steps-to-build">Bouwen</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
   <a href="#file-structure">Structuur</a> •
   <a href="#snapshot">Snapshot</a><br>
   [<a href="../README.md">English</a>] | [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-GR.md">Ελληνικά</a>]<br>
-  <b>Wij hebben uw hulp nodig om dit README bestand te vertalen, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a> en <a href="https://github.com/rustdesk/doc.rustdesk.com">Doc</a> naar uw moedertaal</b>
+  <b>Wij hebben uw hulp nodig om dit README bestand te vertalen, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">Telemost UI</a> en <a href="https://github.com/rustdesk/doc.rustdesk.com">Doc</a> naar uw moedertaal</b>
 </p>
 
-Chat met ons: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
+Chat met ons: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/telemost) | [Reddit](https://www.reddit.com/r/telemost) | [YouTube](https://www.youtube.com/@telemost)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Geavanceerde%20Functies-blue)](https://rustdesk.com/pricing.html)
+[![Telemost Server Pro](https://img.shields.io/badge/Telemost%20Server%20Pro-Geavanceerde%20Functies-blue)](https://rustdesk.com/pricing.html)
 
 Alweer een andere programma voor -bureaublad op afstand-, geschreven in Rust. Werkt -out of the box-, geen configuratie nodig. U heeft volledige controle over uw gegevens, en hoeft zich geen zorgen te maken over de beveiliging. U kunt onze rendez-vous/relay server gebruiken, [je eigen server opzetten](https://rustdesk.com/blog/id-relay-set), of [je eigen rendez-vous/relay-server schrijven](https://github.com/rustdesk/rustdesk-server-demo).
 
-RustDesk verwelkomt bijdragen van iedereen. Zie [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) voor hulp om aan de slag te gaan.
+Telemost verwelkomt bijdragen van iedereen. Zie [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) voor hulp om aan de slag te gaan.
 
 [**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -107,7 +107,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd telemost
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -120,14 +120,14 @@ Begin met het klonen van de repository en het bouwen van de docker container:
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd telemost
+docker build -t "telemost-builder" .
 ```
 
 Elke keer dat u de toepassing moet bouwen, voert u het volgende commando uit:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/telemost -v telemost-git-cache:/home/user/.cargo/git -v telemost-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" telemost-builder
 ```
 
 Let op dat de eerste build langer kan duren omdat de dependencies nog niet zijn gecached; latere builds zullen sneller zijn. Als je extra command line arguments wilt toevoegen aan het build-commando, dan kun je dat doen aan het einde van de opdrachtregel in plaats van `<OPTIONAL-ARGS>`. Bijvoorbeeld: als je een geoptimaliseerde releaseversie wilt bouwen, draai dan het bovenstaande commando gevolgd door `--release`.
@@ -135,16 +135,16 @@ Let op dat de eerste build langer kan duren omdat de dependencies nog niet zijn 
  Het uitvoerbare bestand, in debug-modus, zal verschijnen in de target-map, en kan als volgt worden uitgevoerd:
 
 ```sh
-target/debug/rustdesk
+target/debug/telemost
 ```
 
 Als je een release-versie hebt gebouwd, is het commando als volgt:
 
 ```sh
-target/release/rustdesk
+target/release/telemost
 ```
 
-Zorg ervoor dat je deze commando's van de root van de RustDesk-repository uitvoert, anders kan het programma de nodige afhankelijkheden mogelijk niet vinden. Let ook op dat andere cargo-subcommando's zoals `install` en `run` zijn momenteel niet ondersteund, aangezien deze zouden worden uitgevoerd in een container in plaats van op de host.
+Zorg ervoor dat je deze commando's van de root van de Telemost-repository uitvoert, anders kan het programma de nodige afhankelijkheden mogelijk niet vinden. Let ook op dat andere cargo-subcommando's zoals `install` en `run` zijn momenteel niet ondersteund, aangezien deze zouden worden uitgevoerd in een container in plaats van op de host.
 
 ## Bestandsstructuur
 
@@ -154,7 +154,7 @@ Zorg ervoor dat je deze commando's van de root van de RustDesk-repository uitvoe
 - **[src/ui](https://github.com/rustdesk/rustdesk/tree/master/src/ui)**: GUI
 - **[src/server](https://github.com/rustdesk/rustdesk/tree/master/src/server)**: geluids-, klembord-, invoer- en video-services, netwerkverbindingen
 - **[src/client.rs](https://github.com/rustdesk/rustdesk/tree/master/src/client.rs)**: voor het opzetten van peer-verbindingen
-- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**: Communicatie met [rustdesk-server](https://github.com/rustdesk/rustdesk-server), afwachten van redirect op afstand (TCP hole punching) of een relayed verbinding
+- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**: Communicatie met [telemost-server](https://github.com/rustdesk/rustdesk-server), afwachten van redirect op afstand (TCP hole punching) of een relayed verbinding
 - **[src/platform](https://github.com/rustdesk/rustdesk/tree/master/src/platform)**: platformspecifieke code
 
 ## Snapshot

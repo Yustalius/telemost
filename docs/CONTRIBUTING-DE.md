@@ -1,11 +1,11 @@
-# Beiträge zu RustDesk
+# Beiträge zu Telemost
 
-RustDesk begrüßt Beiträge von jedem. Hier sind die Richtlinien, wenn Sie uns
+Telemost begrüßt Beiträge von jedem. Hier sind die Richtlinien, wenn Sie uns
 helfen möchten:
 
 ## Beiträge
 
-Beiträge zu RustDesk oder seinen Abhängigkeiten sollten in Form von Pull
+Beiträge zu Telemost oder seinen Abhängigkeiten sollten in Form von Pull
 Requests auf GitHub erfolgen. Jeder Pull Request wird von einem Hauptakteur
 (jemand mit der Erlaubnis, Korrekturen einzubringen) geprüft und entweder in den
 Hauptbaum eingefügt oder Feedback für notwendige Änderungen gegeben. Alle
@@ -47,4 +47,4 @@ https://github.com/rustdesk/rustdesk/blob/master/docs/CODE_OF_CONDUCT.md
 
 ## Kommunikation
 
-RustDesk-Mitarbeiter arbeiten häufig im [Discord](https://discord.gg/nDceKgxnkV).
+Telemost-Mitarbeiter arbeiten häufig im [Discord](https://discord.gg/nDceKgxnkV).

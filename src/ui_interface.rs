@@ -1355,7 +1355,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
 
     loop {
         if let Ok(mut c) = ipc::connect(1000, "").await {
-            let mut timer = crate::rustdesk_interval(time::interval(time::Duration::from_secs(1)));
+            let mut timer = crate::telemost_interval(time::interval(time::Duration::from_secs(1)));
             loop {
                 tokio::select! {
                     res = c.next() => {

@@ -22,7 +22,7 @@ sciter.dll
 src/bridge_generated.rs
 src/bridge_generated.io.rs
 *deb
-rustdesk
+telemost
 *.cache
 # appimage
 appimage/AppDir
@@ -58,3 +58,7 @@ libsciter.dylib
 flutter/web/
 # libdrmtap is cloned at build time by build.py (not a submodule)
 /third_party/libdrmtap/
+
+# Внутренние документы форка, не публикуются
+/REBRAND.md
+/PUBLISH-PLAN.md

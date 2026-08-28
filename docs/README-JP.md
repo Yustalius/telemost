@@ -1,23 +1,23 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - あなたのためのリモートデスクトップ"><br>
+  <img src="../res/logo-header.svg" alt="Telemost - あなたのためのリモートデスクトップ"><br>
   <a href="#free-public-servers">Servers</a> •
   <a href="#raw-steps-to-build">Build</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
   <a href="#file-structure">Structure</a> •
   <a href="#snapshot">Snapshot</a><br>
   [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-NL.md">Nederlands</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-DA.md">Dansk</a>] | [<a href="README-GR.md">Ελληνικά</a>] | [<a href="README-TR.md">Türkçe</a>]<br>
-  <b>READMEや<a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a>、 <a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk Doc</a>の翻訳者を歓迎します！</b>
+  <b>READMEや<a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">Telemost UI</a>、 <a href="https://github.com/rustdesk/doc.rustdesk.com">Telemost Doc</a>の翻訳者を歓迎します！</b>
 </p>
 
-私たちと話す: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
+私たちと話す: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/telemost) | [Reddit](https://www.reddit.com/r/telemost) | [YouTube](https://www.youtube.com/@telemost)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%E9%AB%98%E5%BA%A6%E3%81%AA%E6%A9%9F%E8%83%BD-blue)](https://rustdesk.com/pricing.html)
+[![Telemost Server Pro](https://img.shields.io/badge/Telemost%20Server%20Pro-%E9%AB%98%E5%BA%A6%E3%81%AA%E6%A9%9F%E8%83%BD-blue)](https://rustdesk.com/pricing.html)
 
 Rustで書かれた、設定不要ですぐに使えるリモートデスクトップソフトウェアです。自分のデータを完全にコントロールでき、セキュリティの心配もありません。私たちのランデブー/リレーサーバを使うことも、[自分でサーバーをセットアップする](https://rustdesk.com/server) ことも、 [自分でランデブー/リレーサーバを作成する](https://github.com/rustdesk/rustdesk-server-demo)こともできます。
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-RustDeskは皆さんの貢献を歓迎します。  
+Telemostは皆さんの貢献を歓迎します。  
 貢献の方法については[CONTRIBUTING.md](CONTRIBUTING.md)をご確認ください。
 
 [**よくある質問**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
@@ -113,7 +113,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd telemost
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -126,32 +126,32 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd telemost
+docker build -t "telemost-builder" .
 ```
 
 以下のコマンドを実行します:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/telemost -v telemost-git-cache:/home/user/.cargo/git -v telemost-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" telemost-builder
 ```
-このコマンドはRustDeskをビルドする度に実行する必要があります。  
+このコマンドはTelemostをビルドする度に実行する必要があります。  
 
 初回ビルドは時間がかかるかもしれませんが、2回目以降は依存関係がキャッシュされるため、ビルドにかかる時間が短くなります。  
 ビルドコマンドに追加の引数を指定する必要がある場合は、コマンドの最後(`<OPTIONAL-ARGS>`の位置)で指定することができます。例えば、最適化されたリリースバージョンをビルドしたい場合は、上記のコマンドの後に `--release` を追記し実行します。ビルドされた実行ファイルはあなたのシステムのターゲットフォルダに保存され、下記のコマンドで実行することができます。  
 
 デバッグビルドを起動する場合:
 ```sh
-target/debug/rustdesk
+target/debug/telemost
 ```
 
 リリースビルドを起動する場合:
 
 ```sh
-target/release/rustdesk
+target/release/telemost
 ```
 
-コマンドをRustDeskリポジトリのルートから実行していることを確認してください。また、`install` や `run` などの他のcargoサブコマンドは、ホストではなくコンテナ内でプログラムをインストール、実行するため、現在の方法ではサポートされていません。
+コマンドをTelemostリポジトリのルートから実行していることを確認してください。また、`install` や `run` などの他のcargoサブコマンドは、ホストではなくコンテナ内でプログラムをインストール、実行するため、現在の方法ではサポートされていません。
 
 ## ファイル構造
 
@@ -163,13 +163,13 @@ target/release/rustdesk
 - **[src/server](https://github.com/rustdesk/rustdesk/tree/master/src/server)**: 
 オーディオ/クリップボード/入力/ビデオ サービスとネットワーク接続
 - **[src/client.rs](https://github.com/rustdesk/rustdesk/tree/master/src/client.rs)**: ピア接続の開始
-- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**: [rustdesk-server](https://github.com/rustdesk/rustdesk-server)と通信し、リモートの直接接続(TCPホールパンチング)や中継接続を担う。
+- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**: [telemost-server](https://github.com/rustdesk/rustdesk-server)と通信し、リモートの直接接続(TCPホールパンチング)や中継接続を担う。
 - **[src/platform](https://github.com/rustdesk/rustdesk/tree/master/src/platform)**: プラットフォーム固有のコード
 - **[flutter](https://github.com/rustdesk/rustdesk/tree/master/flutter)**: デスクトップとモバイル向けのFlutterコード
 
 > [!注意]
 > **:不正使用に関する免責事項** <br>
-> RustDeskの開発者は、このソフトウェアの非倫理的または違法な使用を容認または支持しません。不正アクセス、不正な制御、またはプライバシーの侵害などの不正使用は、当社のガイドラインに厳密に違反します。開発者は、アプリケーションの不正使用に対して一切の責任を負いません。
+> Telemostの開発者は、このソフトウェアの非倫理的または違法な使用を容認または支持しません。不正アクセス、不正な制御、またはプライバシーの侵害などの不正使用は、当社のガイドラインに厳密に違反します。開発者は、アプリケーションの不正使用に対して一切の責任を負いません。
 
 ## スクリーンショット
 

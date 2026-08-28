@@ -7,7 +7,7 @@ Nous accordons une très grande importance à la sécurité du projet. Nous
 encourageons tous les utilisateurs à nous signaler toute vulnérabilité qu'ils
 découvrent.
 
-Si vous trouvez une vulnérabilité de sécurité dans le projet RustDesk, veuillez
+Si vous trouvez une vulnérabilité de sécurité dans le projet Telemost, veuillez
 la signaler de manière responsable en envoyant un e-mail à info@rustdesk.com.
 
 À ce stade, nous n'avons pas de programme de bug bounty. Nous sommes une petite

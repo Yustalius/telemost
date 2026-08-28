@@ -138,7 +138,7 @@ fn drm_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
 /// same three things, for the same reasons:
 ///
 /// - drops the cached Wayland layout first, because it can predate compositor changes made while no
-///   session was active (rustdesk#15601), and on the hotplug path it is stale by definition;
+///   session was active (telemost#15601), and on the hotplug path it is stale by definition;
 /// - bounds the IPC wait, because `uinput::client::set_resolution` reads its reply with no timeout of
 ///   its own, so a hung uinput socket would otherwise block every video-service start on this branch
 ///   and wedge the hotplug worker inside `rt.block_on`, leaving `UINPUT_REFRESH_BUSY` latched true so

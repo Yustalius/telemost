@@ -1,11 +1,11 @@
-#  RustDesk 기여하기
+#  Telemost 기여하기
 
-RustDesk는 모든 분들의 참여를 환영합니다. 저희를 도와주실 생각이 있으시다면 
+Telemost는 모든 분들의 참여를 환영합니다. 저희를 도와주실 생각이 있으시다면 
  다음 지침을 따르세요:
 
 ## 기여
 
-RustDesk 또는 그 종속성에 대한 기여는 GitHub 풀 리퀘스트 형태로 
+Telemost 또는 그 종속성에 대한 기여는 GitHub 풀 리퀘스트 형태로 
 이루어져야 합니다. 각 풀 리퀘스트는 핵심 기여자 (패치 적용 권한이 
 있는 사람)가 검토하여 메인 트리에 추가하거나 필요한 변경 사항에
 대한 피드백을 제공합니다. 핵심 기여자의 기여를 포함하여 모든 기여는
@@ -43,4 +43,4 @@ https://github.com/rustdesk/rustdesk/blob/master/docs/CODE_OF_CONDUCT.md
 
 ## 커뮤니케이션
 
-RustDesk 기여자들은 [Discord](https://discord.gg/nDceKgxnkV)에서 활동하고 있습니다.
+Telemost 기여자들은 [Discord](https://discord.gg/nDceKgxnkV)에서 활동하고 있습니다.
