@@ -61,6 +61,12 @@ mod ui_session_interface;
 
 mod hbbs_http;
 
+#[cfg(all(
+    feature = "http-tunnel",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod http_tunnel;
+
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub mod clipboard_file;
 

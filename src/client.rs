@@ -895,11 +895,14 @@ impl Client {
     async fn create_relay(
         peer: &str,
         uuid: String,
-        relay_server: String,
+        mut relay_server: String,
         key: &str,
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        if config::is_http_tunnel_enabled() {
+            relay_server = config::HTTP_TUNNEL_RELAY_SERVER.to_owned();
+        }
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
@@ -1874,7 +1877,8 @@ impl LoginConfigHandler {
             config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
                 || force_relay
                 || use_ws()
-                || Config::is_proxy();
+                || Config::is_proxy()
+                || config::is_http_tunnel_enabled();
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
