@@ -1220,6 +1220,26 @@ pub async fn run_mappings(cfg: ClientConfig, mappings: Vec<PortMap>) -> Result<(
     }
 }
 
+// Tokio binds listeners with HANDLE_FLAG_INHERIT set, so a child spawned later
+// via std::process::Command inherits the raw handle and keeps the port bound
+// after this process exits; clear the flag right after bind to prevent that.
+#[cfg(windows)]
+fn clear_inherit_flag(socket: &impl std::os::windows::io::AsRawSocket) {
+    extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+    let handle = socket.as_raw_socket() as usize as *mut std::ffi::c_void;
+    let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        log::warn!(
+            "failed to clear HANDLE_FLAG_INHERIT on tunnel listener socket; a child process spawned later could inherit it and keep the port held after exit"
+        );
+    }
+}
+
 pub async fn start_mappings(
     cfg: ClientConfig,
     mappings: Vec<PortMap>,
@@ -1255,6 +1275,8 @@ pub async fn start_mappings(
                 let listener = TcpListener::bind(local)
                     .await
                     .with_context(|| format!("binding TCP listener {local}"))?;
+                #[cfg(windows)]
+                clear_inherit_flag(&listener);
                 log::info!("TCP {local} -> tcp://{}", mapping.target);
                 bound.push(BoundMapping::Tcp(listener, mapping.target));
             }
@@ -1262,6 +1284,8 @@ pub async fn start_mappings(
                 let socket = UdpSocket::bind(local)
                     .await
                     .with_context(|| format!("binding UDP listener {local}"))?;
+                #[cfg(windows)]
+                clear_inherit_flag(&socket);
                 log::info!("UDP {local} -> udp://{}", mapping.target);
                 bound.push(BoundMapping::Udp(socket, mapping.target));
             }
@@ -1707,5 +1731,135 @@ mod tests {
             Some(TunFrame::Data(Bytes::from_static(b"xyz!")))
         );
         assert_eq!(dec.next_frame(), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_clear_inherit_flag_tcp() {
+        use std::os::windows::io::AsRawSocket;
+
+        extern "system" {
+            fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let handle = listener.as_raw_socket() as usize as *mut std::ffi::c_void;
+
+        let mut flags: u32 = 0;
+        let ok = unsafe { GetHandleInformation(handle, &mut flags) };
+        assert_ne!(ok, 0);
+        assert_ne!(
+            flags & HANDLE_FLAG_INHERIT,
+            0,
+            "TCP listener should be inheritable before clearing"
+        );
+
+        clear_inherit_flag(&listener);
+
+        let mut flags2: u32 = 0;
+        let ok2 = unsafe { GetHandleInformation(handle, &mut flags2) };
+        assert_ne!(ok2, 0);
+        assert_eq!(
+            flags2 & HANDLE_FLAG_INHERIT,
+            0,
+            "TCP listener should not be inheritable after clearing"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_clear_inherit_flag_udp() {
+        use std::os::windows::io::AsRawSocket;
+
+        extern "system" {
+            fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let handle = socket.as_raw_socket() as usize as *mut std::ffi::c_void;
+
+        let mut flags: u32 = 0;
+        let ok = unsafe { GetHandleInformation(handle, &mut flags) };
+        assert_ne!(ok, 0);
+        assert_ne!(
+            flags & HANDLE_FLAG_INHERIT,
+            0,
+            "UDP socket should be inheritable before clearing"
+        );
+
+        clear_inherit_flag(&socket);
+
+        let mut flags2: u32 = 0;
+        let ok2 = unsafe { GetHandleInformation(handle, &mut flags2) };
+        assert_ne!(ok2, 0);
+        assert_eq!(
+            flags2 & HANDLE_FLAG_INHERIT,
+            0,
+            "UDP socket should not be inheritable after clearing"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rebind_after_child_spawn_tcp() {
+        use std::process::{Command, Stdio};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        clear_inherit_flag(&listener);
+
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "20", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        drop(listener);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let rebind = TcpListener::bind(addr).await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            rebind.is_ok(),
+            "expected to rebind TCP {addr} after clearing inherit flag, got {:?}",
+            rebind.err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rebind_after_child_spawn_udp() {
+        use std::process::{Command, Stdio};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        clear_inherit_flag(&socket);
+
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "20", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        drop(socket);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let rebind = UdpSocket::bind(addr).await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            rebind.is_ok(),
+            "expected to rebind UDP {addr} after clearing inherit flag, got {:?}",
+            rebind.err()
+        );
     }
 }
