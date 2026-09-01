@@ -7,10 +7,31 @@ use hbb_common::{
 };
 use httptun::{start_mappings, telemost_preset_maps, ClientConfig, Mode, ProxyOpt};
 
-pub async fn start() {
-    if let Err(error) = start_inner().await {
-        log::error!("HTTP batch tunnel failed to start: {error}");
+const MAX_START_ATTEMPTS: u32 = 10;
+const MAX_RETRY_DELAY_SECS: u64 = 5;
+
+pub async fn start() -> bool {
+    // Ports 23455-23457 may still be held by a just-killed predecessor for a
+    // few seconds, so retry with backoff instead of failing on the first try.
+    let mut last_error = None;
+    for attempt in 1..=MAX_START_ATTEMPTS {
+        match start_inner().await {
+            Ok(()) => return true,
+            Err(error) => {
+                log::warn!("HTTP batch tunnel start attempt {attempt} failed: {error}");
+                if attempt < MAX_START_ATTEMPTS {
+                    let delay = Duration::from_secs((attempt as u64).min(MAX_RETRY_DELAY_SECS));
+                    tokio::time::sleep(delay).await;
+                }
+                last_error = Some(error);
+            }
+        }
     }
+    match last_error {
+        Some(error) => log::error!("HTTP batch tunnel failed to start: {error}"),
+        None => log::error!("HTTP batch tunnel failed to start"),
+    }
+    false
 }
 
 async fn start_inner() -> Result<()> {

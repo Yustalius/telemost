@@ -635,8 +635,18 @@ pub async fn start_server(is_server: bool, no_server: bool) {
             feature = "http-tunnel",
             any(target_os = "macos", target_os = "linux", target_os = "windows")
         ))]
-        crate::http_tunnel::start().await;
-        crate::RendezvousMediator::start_all().await;
+        let tunnel_ready = crate::http_tunnel::start().await;
+        #[cfg(not(all(
+            feature = "http-tunnel",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )))]
+        let tunnel_ready = true;
+        // Without a working tunnel the mediator would sit on an unserved local port and never register_pk.
+        if tunnel_ready {
+            crate::RendezvousMediator::start_all().await;
+        } else {
+            log::error!("HTTP batch tunnel is not ready; not starting rendezvous mediator");
+        }
     } else {
         match crate::ipc::connect(1000, "").await {
             Ok(mut conn) => {
