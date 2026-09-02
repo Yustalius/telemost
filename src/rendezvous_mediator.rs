@@ -106,6 +106,26 @@ pub struct RendezvousMediator {
     keep_alive: i32,
 }
 
+// The mediator registers over the local HTTP tunnel port; without a ready tunnel
+// registration has nowhere to connect, so gate the registration loop on it.
+#[cfg(all(
+    feature = "http-tunnel",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[inline]
+fn http_tunnel_ready() -> bool {
+    crate::http_tunnel::is_ready()
+}
+
+#[cfg(not(all(
+    feature = "http-tunnel",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+)))]
+#[inline]
+fn http_tunnel_ready() -> bool {
+    true
+}
+
 impl RendezvousMediator {
     pub fn restart() {
         SHOULD_EXIT.store(true, Ordering::SeqCst);
@@ -151,6 +171,7 @@ impl RendezvousMediator {
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
             if !config::option2bool("stop-service", &Config::get_option("stop-service"))
                 && !crate::platform::installing_service()
+                && http_tunnel_ready()
             {
                 let mut futs = Vec::new();
                 let servers = Config::get_rendezvous_servers();
