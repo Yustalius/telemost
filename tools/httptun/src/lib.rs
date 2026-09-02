@@ -1240,6 +1240,51 @@ fn clear_inherit_flag(socket: &impl std::os::windows::io::AsRawSocket) {
     }
 }
 
+// Windows enables SIO_UDP_CONNRESET by default, which surfaces a stale ICMP
+// port-unreachable (from a previous sendto) as WSAECONNRESET on the next
+// recv_from of an unconnected UDP socket; disable it so that harmless reset
+// doesn't look like a real recv error.
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &impl std::os::windows::io::AsRawSocket) {
+    extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dwIoControlCode: u32,
+            lpvInBuffer: *mut std::ffi::c_void,
+            cbInBuffer: u32,
+            lpvOutBuffer: *mut std::ffi::c_void,
+            cbOutBuffer: u32,
+            lpcbBytesReturned: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+            lpCompletionRoutine: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    let handle = socket.as_raw_socket() as usize;
+    let mut disabled: i32 = 0;
+    let mut bytes_returned: u32 = 0;
+    let ok = unsafe {
+        WSAIoctl(
+            handle,
+            SIO_UDP_CONNRESET,
+            &mut disabled as *mut i32 as *mut std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        log::warn!(
+            "failed to disable SIO_UDP_CONNRESET on tunnel UDP socket; a stale ICMP port-unreachable could surface as WSAECONNRESET on recv_from"
+        );
+    }
+}
+
 pub async fn start_mappings(
     cfg: ClientConfig,
     mappings: Vec<PortMap>,
@@ -1286,6 +1331,8 @@ pub async fn start_mappings(
                     .with_context(|| format!("binding UDP listener {local}"))?;
                 #[cfg(windows)]
                 clear_inherit_flag(&socket);
+                #[cfg(windows)]
+                disable_udp_connreset(&socket);
                 log::info!("UDP {local} -> udp://{}", mapping.target);
                 bound.push(BoundMapping::Udp(socket, mapping.target));
             }
@@ -1411,10 +1458,14 @@ async fn serve_udp_mapping(socket: UdpSocket, target: String, ctx: Arc<TunnelCtx
     >::new()));
     let mut buf = vec![0u8; u16::MAX as usize + 1];
     loop {
-        let (n, source) = socket
-            .recv_from(&mut buf)
-            .await
-            .context("receiving local UDP datagram")?;
+        let (n, source) = match socket.recv_from(&mut buf).await {
+            Ok(value) => value,
+            // Windows can surface a stale ICMP port-unreachable as WSAECONNRESET on an
+            // unconnected UDP socket; tearing the mapping down over it would take the
+            // tunnel's other listeners with it.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Err(error) => return Err(error).context("receiving local UDP datagram"),
+        };
         if n == 0 {
             log::debug!("ignoring empty UDP datagram from {source}");
             continue;
@@ -1799,6 +1850,16 @@ mod tests {
             0,
             "UDP socket should not be inheritable after clearing"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_disable_udp_connreset_keeps_socket_usable() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        disable_udp_connreset(&socket);
+
+        assert!(socket.local_addr().is_ok());
     }
 
     #[cfg(windows)]
