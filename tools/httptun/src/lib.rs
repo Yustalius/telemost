@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -79,6 +80,54 @@ pub enum ProxyOpt {
     Explicit(String),
 }
 
+/// Which wire protocol the client speaks (and the server accepts).
+#[derive(Clone, Debug)]
+pub enum WireApi {
+    /// v1: `/api/v1/*` paths, fixed opaque route ids, browser-like headers and
+    /// an optional shared bearer token. This is the obfuscated public shape.
+    V1 { token: Option<String> },
+    /// Legacy: `/o /u /d /c` with an arbitrary `X-Target`. Kept only for the
+    /// migration window; the server accepts it only under `allow_legacy`.
+    Legacy,
+}
+
+impl WireApi {
+    fn open_path(&self) -> &'static str {
+        match self {
+            WireApi::V1 { .. } => "/api/v1/session/open",
+            WireApi::Legacy => "/o",
+        }
+    }
+    fn send_path(&self) -> &'static str {
+        match self {
+            WireApi::V1 { .. } => "/api/v1/session/send",
+            WireApi::Legacy => "/u",
+        }
+    }
+    fn recv_path(&self) -> &'static str {
+        match self {
+            WireApi::V1 { .. } => "/api/v1/session/recv",
+            WireApi::Legacy => "/d",
+        }
+    }
+    fn close_path(&self) -> &'static str {
+        match self {
+            WireApi::V1 { .. } => "/api/v1/session/close",
+            WireApi::Legacy => "/c",
+        }
+    }
+}
+
+/// A fixed server-side route: the v1 client asks for it by opaque `id`, and the
+/// server dials the associated target. Replaces the arbitrary `X-Target` so the
+/// server is not an open proxy.
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub id: String,
+    pub transport: Transport,
+    pub target: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -88,6 +137,20 @@ pub struct ServerConfig {
     pub timeout: Duration,
     pub poll_wait: Duration,
     pub sans: Vec<String>,
+    /// PEM certificate chain; when both this and `tls_key` are set the server
+    /// serves that certificate instead of a startup self-signed one.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key paired with `tls_cert`.
+    pub tls_key: Option<PathBuf>,
+    /// Shared bearer token required on every `/api/v1/*` request; `None` leaves
+    /// the v1 API unauthenticated (dev/tests only).
+    pub auth_token: Option<String>,
+    /// Upper bound on concurrent sessions; opens past it are refused with 429.
+    pub max_sessions: usize,
+    /// Accept the legacy `/o /u /d /c` + `X-Target` API (migration only).
+    pub allow_legacy: bool,
+    /// Fixed v1 routes the server will dial by id.
+    pub routes: Vec<Route>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +161,7 @@ pub struct ClientConfig {
     pub danger: bool,
     pub keepalive: Duration,
     pub timeout: Duration,
+    pub wire: WireApi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +235,75 @@ fn validate_host_port(value: &str) -> std::result::Result<(), String> {
         return Err("target port must be greater than zero".to_owned());
     }
     Ok(())
+}
+
+/// The four fixed v1 route ids. They are opaque tokens on the wire (no
+/// `tcp://host:port` leaks); the server maps each to a concrete target.
+pub const ROUTE_RENDEZVOUS_UDP: &str = "ru";
+pub const ROUTE_RENDEZVOUS_TCP: &str = "rt";
+pub const ROUTE_NAT_TEST: &str = "nt";
+pub const ROUTE_RELAY: &str = "rl";
+/// Diagnostic loopback route for the measurement hooks (not one of the four).
+pub const ROUTE_ECHO: &str = "echo";
+
+/// v1 local listeners for telemost. The `target` field carries the opaque route
+/// id (not a host:port); the server resolves it via [`telemost_preset_routes`].
+pub fn telemost_preset_maps_v1() -> Vec<PortMap> {
+    vec![
+        PortMap {
+            transport: Transport::Udp,
+            local_port: 23456,
+            target: ROUTE_RENDEZVOUS_UDP.to_owned(),
+        },
+        PortMap {
+            transport: Transport::Tcp,
+            local_port: 23456,
+            target: ROUTE_RENDEZVOUS_TCP.to_owned(),
+        },
+        PortMap {
+            transport: Transport::Tcp,
+            local_port: 23455,
+            target: ROUTE_NAT_TEST.to_owned(),
+        },
+        PortMap {
+            transport: Transport::Tcp,
+            local_port: 23457,
+            target: ROUTE_RELAY.to_owned(),
+        },
+    ]
+}
+
+/// Server-side route table for telemost. hbbr rejects relay requests from a
+/// loopback source, so the relay route dials the VPS's public address; hbbs
+/// (rendezvous / NAT-test) accepts loopback and stays on 127.0.0.1.
+pub fn telemost_preset_routes(relay_host: &str) -> Vec<Route> {
+    let relay_target = if relay_host.contains(':') {
+        format!("[{relay_host}]:21117")
+    } else {
+        format!("{relay_host}:21117")
+    };
+    vec![
+        Route {
+            id: ROUTE_RENDEZVOUS_UDP.to_owned(),
+            transport: Transport::Udp,
+            target: "127.0.0.1:21116".to_owned(),
+        },
+        Route {
+            id: ROUTE_RENDEZVOUS_TCP.to_owned(),
+            transport: Transport::Tcp,
+            target: "127.0.0.1:21116".to_owned(),
+        },
+        Route {
+            id: ROUTE_NAT_TEST.to_owned(),
+            transport: Transport::Tcp,
+            target: "127.0.0.1:21115".to_owned(),
+        },
+        Route {
+            id: ROUTE_RELAY.to_owned(),
+            transport: Transport::Tcp,
+            target: relay_target,
+        },
+    ]
 }
 
 pub fn telemost_preset_maps(relay_host: &str) -> Vec<PortMap> {
@@ -342,6 +475,10 @@ struct ServerOpts {
     keepalive: Duration,
     timeout: Duration,
     poll_wait: Duration,
+    auth_token: Option<Arc<str>>,
+    max_sessions: usize,
+    allow_legacy: bool,
+    routes: Arc<HashMap<String, Route>>,
 }
 
 pub async fn run_server(cfg: ServerConfig) -> Result<()> {
@@ -354,9 +491,15 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
 /// Like [`run_server`] but on an already-bound listener (handy for embedding and
 /// tests that need to know the actual port before the server starts).
 pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
-    let tls = build_server_tls(&cfg.sans).context("building self-signed TLS config")?;
+    let tls = build_server_tls(&cfg).context("building TLS config")?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let local = listener.local_addr().ok();
+
+    let routes: HashMap<String, Route> = cfg
+        .routes
+        .iter()
+        .map(|r| (r.id.clone(), r.clone()))
+        .collect();
 
     let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let opts = ServerOpts {
@@ -364,15 +507,23 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         keepalive: cfg.keepalive,
         timeout: cfg.timeout,
         poll_wait: cfg.poll_wait,
+        auth_token: cfg.auth_token.as_deref().map(Arc::from),
+        max_sessions: cfg.max_sessions.max(1),
+        allow_legacy: cfg.allow_legacy,
+        routes: Arc::new(routes),
     };
 
     spawn_sweeper(reg.clone());
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, legacy={}, routes={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
-        cfg.echo_all
+        cfg.echo_all,
+        opts.auth_token.is_some(),
+        opts.allow_legacy,
+        opts.routes.len(),
+        opts.max_sessions,
     );
 
     loop {
@@ -435,18 +586,53 @@ async fn handle(
     let query = req.uri().query().unwrap_or("").to_owned();
     log::debug!("--> {method} {path}?{query}");
 
+    // Every /api/v1/* request must carry the shared bearer token (when set).
+    if path.starts_with("/api/v1/") && !authorized(&req, &opts) {
+        let resp = text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n");
+        log::debug!("<-- {method} {path} {}", resp.status());
+        return Ok(resp);
+    }
+
     let resp = match (&method, path.as_str()) {
-        (&Method::POST, "/o") => handle_open(req, &reg, &opts).await,
-        (&Method::POST, "/u") => handle_up(req, &reg).await,
-        (&Method::GET, "/d") => handle_down(req, &reg, &opts).await,
-        (&Method::POST, "/c") => handle_close(req, &reg).await,
-        (&Method::GET, "/") | (&Method::GET, "/health") => {
-            text_resp(StatusCode::OK, "httptun-server ok\n")
-        }
+        // v1 API — opaque routes, bearer auth, web-app-shaped paths.
+        (&Method::POST, "/api/v1/session/open") => handle_open_v1(req, &reg, &opts).await,
+        (&Method::POST, "/api/v1/session/send") => handle_up(req, &reg).await,
+        (&Method::GET, "/api/v1/session/recv") => handle_down(req, &reg, &opts).await,
+        (&Method::POST, "/api/v1/session/close") => handle_close(req, &reg).await,
+        // Legacy API — arbitrary X-Target, migration window only.
+        (&Method::POST, "/o") if opts.allow_legacy => handle_open(req, &reg, &opts).await,
+        (&Method::POST, "/u") if opts.allow_legacy => handle_up(req, &reg).await,
+        (&Method::GET, "/d") if opts.allow_legacy => handle_down(req, &reg, &opts).await,
+        (&Method::POST, "/c") if opts.allow_legacy => handle_close(req, &reg).await,
+        (&Method::GET, "/") => decoy_resp(),
+        (&Method::GET, "/health") => text_resp(StatusCode::OK, "ok\n"),
         _ => text_resp(StatusCode::NOT_FOUND, "not found\n"),
     };
     log::debug!("<-- {method} {path} {}", resp.status());
     Ok(resp)
+}
+
+fn authorized(req: &Request<Incoming>, opts: &ServerOpts) -> bool {
+    let expected = match &opts.auth_token {
+        Some(token) => token,
+        None => return true,
+    };
+    req.headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|got| got == expected.as_ref())
+        .unwrap_or(false)
+}
+
+fn decoy_resp() -> Response<BoxBody> {
+    let body = "<!doctype html><title>ya-telemost</title><h1>It works</h1>\n";
+    let mut response = Response::new(full(Bytes::from_static(body.as_bytes())));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
 }
 
 async fn handle_open(
@@ -468,8 +654,56 @@ async fn handle_open(
         _ => return text_resp(StatusCode::BAD_REQUEST, "missing X-Target\n"),
     };
 
-    if reg.lock().await.contains_key(&sid) {
-        return text_resp(StatusCode::OK, "");
+    open_with_limit(reg, sid, target, opts).await
+}
+
+async fn handle_open_v1(
+    req: Request<Incoming>,
+    reg: &Registry,
+    opts: &ServerOpts,
+) -> Response<BoxBody> {
+    let sid = match query_param(req.uri(), "s") {
+        Some(s) if !s.is_empty() => s,
+        _ => return text_resp(StatusCode::BAD_REQUEST, "missing session id\n"),
+    };
+    let route = match query_param(req.uri(), "r") {
+        Some(r) if !r.is_empty() => r,
+        _ => return text_resp(StatusCode::BAD_REQUEST, "missing route\n"),
+    };
+    let target = match resolve_route(&route, opts) {
+        Some(t) => t,
+        None => return text_resp(StatusCode::BAD_REQUEST, "unknown route\n"),
+    };
+
+    open_with_limit(reg, sid, target, opts).await
+}
+
+/// Maps an opaque v1 route id to a concrete `<transport>://host:port` target
+/// (or the built-in echo). Returns `None` for anything not in the fixed table,
+/// so an arbitrary target can never be reached through the v1 API.
+fn resolve_route(route: &str, opts: &ServerOpts) -> Option<String> {
+    if opts.echo_all || route == ROUTE_ECHO {
+        return Some("echo".to_owned());
+    }
+    opts.routes
+        .get(route)
+        .map(|r| format!("{}://{}", r.transport.as_str(), r.target))
+}
+
+async fn open_with_limit(
+    reg: &Registry,
+    sid: String,
+    target: String,
+    opts: &ServerOpts,
+) -> Response<BoxBody> {
+    {
+        let guard = reg.lock().await;
+        if guard.contains_key(&sid) {
+            return text_resp(StatusCode::OK, "");
+        }
+        if guard.len() >= opts.max_sessions {
+            return text_resp(StatusCode::TOO_MANY_REQUESTS, "session limit reached\n");
+        }
     }
 
     match open_session(reg, sid, target, opts).await {
@@ -848,7 +1082,56 @@ async fn handle_close(req: Request<Incoming>, reg: &Registry) -> Response<BoxBod
     text_resp(StatusCode::OK, "")
 }
 
-fn build_server_tls(sans: &[String]) -> Result<rustls::ServerConfig> {
+fn build_server_tls(cfg: &ServerConfig) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let (certs, key): (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) =
+        match (&cfg.tls_cert, &cfg.tls_key) {
+            (Some(cert_path), Some(key_path)) => load_pem_cert(cert_path, key_path)?,
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("both --tls-cert and --tls-key must be given together")
+            }
+            (None, None) => self_signed_cert(&cfg.sans)?,
+        };
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("selecting TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("installing server certificate")?;
+    Ok(config)
+}
+
+fn load_pem_cert(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("reading TLS cert {}", cert_path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing TLS cert {}", cert_path.display()))?;
+    if certs.is_empty() {
+        bail!("no certificates found in {}", cert_path.display());
+    }
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("reading TLS key {}", key_path.display()))?;
+    Ok((certs, key))
+}
+
+fn self_signed_cert(
+    sans: &[String],
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     let sans: Vec<String> = if sans.is_empty() {
@@ -859,15 +1142,7 @@ fn build_server_tls(sans: &[String]) -> Result<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(sans).context("rcgen self-signed cert")?;
     let cert_der: CertificateDer<'static> = cert.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .context("selecting TLS protocol versions")?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
-        .context("installing self-signed cert")?;
-    Ok(config)
+    Ok((vec![cert_der], PrivateKeyDer::Pkcs8(key_der)))
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +1154,7 @@ struct TunnelCtx {
     server: String,
     mode: Mode,
     keepalive: Duration,
+    wire: WireApi,
 }
 
 enum Up {
@@ -923,7 +1199,13 @@ impl TunnelSender {
             Up::Batch { seq } => {
                 let n = *seq;
                 *seq += 1;
-                let url = format!("{}/u?s={}&seq={}", self.ctx.server, self.sid, n);
+                let url = format!(
+                    "{}{}?s={}&seq={}",
+                    self.ctx.server,
+                    self.ctx.wire.send_path(),
+                    self.sid,
+                    n
+                );
                 let resp = self
                     .ctx
                     .client
@@ -949,11 +1231,22 @@ impl TunnelSender {
             Up::Batch { seq } => {
                 let n = *seq;
                 *seq += 1;
-                let url = format!("{}/u?s={}&seq={}", self.ctx.server, self.sid, n);
+                let url = format!(
+                    "{}{}?s={}&seq={}",
+                    self.ctx.server,
+                    self.ctx.wire.send_path(),
+                    self.sid,
+                    n
+                );
                 let _ = self.ctx.client.post(&url).body(encode_close()).send().await;
             }
         }
-        let url = format!("{}/c?s={}", self.ctx.server, self.sid);
+        let url = format!(
+            "{}{}?s={}",
+            self.ctx.server,
+            self.ctx.wire.close_path(),
+            self.sid
+        );
         let _ = self.ctx.client.post(&url).send().await;
         self.closed.store(true, Relaxed);
     }
@@ -964,14 +1257,23 @@ async fn open_tunnel(
     sid: String,
     target: &str,
 ) -> Result<(TunnelSender, TunnelReceiver)> {
-    let open_url = format!("{}/o?s={}", ctx.server, sid);
-    let resp = ctx
-        .client
-        .post(&open_url)
-        .header("x-target", target)
-        .send()
-        .await
-        .context("open session POST /o")?;
+    let open = match &ctx.wire {
+        WireApi::V1 { .. } => {
+            let open_url = format!(
+                "{}{}?s={}&r={}",
+                ctx.server,
+                ctx.wire.open_path(),
+                sid,
+                target
+            );
+            ctx.client.post(&open_url)
+        }
+        WireApi::Legacy => {
+            let open_url = format!("{}{}?s={}", ctx.server, ctx.wire.open_path(), sid);
+            ctx.client.post(&open_url).header("x-target", target)
+        }
+    };
+    let resp = open.send().await.context("open session")?;
     if !resp.status().is_success() {
         bail!(
             "server refused session for {target}: {} {}",
@@ -995,7 +1297,7 @@ async fn open_tunnel(
     let up = match ctx.mode {
         Mode::Stream => {
             let (body_tx, body_rx) = fmpsc::channel::<Bytes>(CHAN_CAP);
-            let up_url = format!("{}/u?s={}", ctx.server, sid);
+            let up_url = format!("{}{}?s={}", ctx.server, ctx.wire.send_path(), sid);
             let ctx2 = ctx.clone();
             let closed2 = closed.clone();
             tokio::spawn(async move {
@@ -1060,7 +1362,7 @@ async fn down_driver_stream(
     reconnects: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
 ) {
-    let url = format!("{}/d?s={}", ctx.server, sid);
+    let url = format!("{}{}?s={}", ctx.server, ctx.wire.recv_path(), sid);
     let mut attempts = 0u32;
     while !closed.load(Relaxed) {
         let resp = match ctx.client.get(&url).send().await {
@@ -1134,7 +1436,7 @@ async fn down_driver_batch(
 ) {
     let mut seq = 0u64;
     while !closed.load(Relaxed) {
-        let url = format!("{}/d?s={}&seq={}", ctx.server, sid, seq);
+        let url = format!("{}{}?s={}&seq={}", ctx.server, ctx.wire.recv_path(), sid, seq);
         seq += 1;
         let resp = match ctx.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
@@ -1183,11 +1485,39 @@ async fn down_driver_batch(
     closed.store(true, Relaxed);
 }
 
+// A current Chrome UA; the v1 requests should look like an ordinary web app's
+// XHR/fetch traffic rather than a bespoke tunnel client.
+const V1_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 fn build_client(cfg: &ClientConfig) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .danger_accept_invalid_certs(cfg.danger)
         .connect_timeout(cfg.timeout)
         .pool_max_idle_per_host(16);
+    if let WireApi::V1 { token } = &cfg.wire {
+        b = b.user_agent(V1_USER_AGENT);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("*/*"),
+        );
+        headers.insert(
+            http::header::ACCEPT_LANGUAGE,
+            http::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip, deflate, br"),
+        );
+        if let Some(token) = token {
+            let mut value = http::HeaderValue::try_from(format!("Bearer {token}"))
+                .context("building Authorization header")?;
+            value.set_sensitive(true);
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
+        b = b.default_headers(headers);
+    }
     b = match &cfg.proxy {
         ProxyOpt::Env => b,
         ProxyOpt::Direct => b.no_proxy(),
@@ -1204,6 +1534,7 @@ fn ctx_from(cfg: &ClientConfig) -> Result<Arc<TunnelCtx>> {
         server: cfg.server.trim_end_matches('/').to_owned(),
         mode: cfg.mode,
         keepalive: cfg.keepalive,
+        wire: cfg.wire.clone(),
         // cfg.timeout is applied as reqwest connect_timeout in build_client.
     }))
 }
@@ -1373,7 +1704,10 @@ pub async fn run_tcp_mapping_on(
     target: String,
     cfg: ClientConfig,
 ) -> Result<()> {
-    validate_host_port(&target).map_err(|error| anyhow!(error))?;
+    // In v1 `target` is an opaque route id resolved server-side, not a host:port.
+    if matches!(cfg.wire, WireApi::Legacy) {
+        validate_host_port(&target).map_err(|error| anyhow!(error))?;
+    }
     serve_tcp_mapping(listener, target, ctx_from(&cfg)?).await
 }
 
@@ -1397,11 +1731,20 @@ async fn serve_tcp_mapping(
     }
 }
 
+/// In v1 the mapping `target` is an opaque route id sent verbatim; in legacy it
+/// is a host:port that becomes a `<transport>://` X-Target.
+fn open_arg(ctx: &TunnelCtx, transport: Transport, target: &str) -> String {
+    match ctx.wire {
+        WireApi::V1 { .. } => target.to_owned(),
+        WireApi::Legacy => format!("{}://{}", transport.as_str(), target),
+    }
+}
+
 async fn handle_tcp_connection(tcp: TcpStream, target: &str, ctx: Arc<TunnelCtx>) -> Result<()> {
     let sid = new_sid();
-    let x_target = format!("tcp://{target}");
-    log::debug!("TCP mapping -> {x_target} (session {sid})");
-    let (sender, receiver) = open_tunnel(ctx, sid, &x_target).await?;
+    let open = open_arg(&ctx, Transport::Tcp, target);
+    log::debug!("TCP mapping -> {open} (session {sid})");
+    let (sender, receiver) = open_tunnel(ctx, sid, &open).await?;
     bridge_tcp(tcp, sender, receiver).await;
     Ok(())
 }
@@ -1446,7 +1789,9 @@ pub async fn run_udp_mapping_on(
     target: String,
     cfg: ClientConfig,
 ) -> Result<()> {
-    validate_host_port(&target).map_err(|error| anyhow!(error))?;
+    if matches!(cfg.wire, WireApi::Legacy) {
+        validate_host_port(&target).map_err(|error| anyhow!(error))?;
+    }
     serve_udp_mapping(socket, target, ctx_from(&cfg)?).await
 }
 
@@ -1511,9 +1856,9 @@ async fn run_udp_peer(
     mut local_rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> Result<()> {
     let sid = new_sid();
-    let x_target = format!("udp://{target}");
-    log::debug!("UDP mapping {source} -> {x_target} (session {sid})");
-    let (mut sender, mut receiver) = open_tunnel(ctx, sid, &x_target).await?;
+    let open = open_arg(&ctx, Transport::Udp, &target);
+    log::debug!("UDP mapping {source} -> {open} (session {sid})");
+    let (mut sender, mut receiver) = open_tunnel(ctx, sid, &open).await?;
     let idle = tokio::time::sleep(SESSION_IDLE);
     tokio::pin!(idle);
     loop {
@@ -1733,6 +2078,42 @@ pub async fn throughput(cfg: &ClientConfig, to: &str, seconds: u64) -> Result<()
         mbps: round3(mbps),
         reconnects: reconnects.load(Relaxed),
     };
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
+/// One HTTPS GET with the tunnel's exact TLS stack (reqwest + the native root
+/// store, honoring `danger` and the env proxy), so a run under corp VPN answers
+/// "does `danger:false` validation survive the MWG proxy?" authoritatively.
+/// Prints one JSON line; never errors on a TLS/connect failure (that is data).
+pub async fn tls_probe(cfg: &ClientConfig, url: &str) -> Result<()> {
+    let client = build_client(cfg)?;
+    let started = Instant::now();
+    let (ok, status, error) = match client.get(url).send().await {
+        Ok(resp) => (true, Some(resp.status().as_u16()), None),
+        Err(e) => {
+            // Walk the source chain so the TLS cause (e.g. "invalid peer
+            // certificate: UnknownIssuer" / "Expired") is visible, not just the
+            // top "error sending request" wrapper.
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                msg.push_str(" -> ");
+                msg.push_str(&s.to_string());
+                src = s.source();
+            }
+            (false, e.status().map(|s| s.as_u16()), Some(msg))
+        }
+    };
+    let report = serde_json::json!({
+        "url": url,
+        "danger": cfg.danger,
+        "proxy": format!("{:?}", cfg.proxy),
+        "ms": round3(started.elapsed().as_secs_f64() * 1000.0),
+        "ok": ok,
+        "status": status,
+        "error": error,
+    });
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }

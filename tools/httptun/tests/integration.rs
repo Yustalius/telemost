@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use httptun::{
-    run_server_on, run_tcp_mapping_on, run_udp_mapping_on, ClientConfig, Mode, ProxyOpt,
-    ServerConfig,
+    run_server_on, run_tcp_mapping_on, run_udp_mapping_on, ClientConfig, Mode, ProxyOpt, Route,
+    ServerConfig, Transport, WireApi,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -62,10 +62,8 @@ async fn spawn_udp_echo_target() -> SocketAddr {
     address
 }
 
-async fn spawn_server(echo_all: bool) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let cfg = ServerConfig {
+fn base_server_cfg(echo_all: bool) -> ServerConfig {
+    ServerConfig {
         listen: any_addr(),
         echo_all,
         mode: Mode::Stream,
@@ -73,11 +71,26 @@ async fn spawn_server(echo_all: bool) -> u16 {
         timeout: Duration::from_secs(5),
         poll_wait: Duration::from_secs(1),
         sans: vec!["localhost".into(), "127.0.0.1".into()],
-    };
+        tls_cert: None,
+        tls_key: None,
+        auth_token: None,
+        max_sessions: 256,
+        allow_legacy: true,
+        routes: Vec::new(),
+    }
+}
+
+async fn spawn_server_with(cfg: ServerConfig) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _ = run_server_on(listener, cfg).await;
     });
     port
+}
+
+async fn spawn_server(echo_all: bool) -> u16 {
+    spawn_server_with(base_server_cfg(echo_all)).await
 }
 
 fn client_config(server_port: u16, mode: Mode, proxy: ProxyOpt) -> ClientConfig {
@@ -88,6 +101,7 @@ fn client_config(server_port: u16, mode: Mode, proxy: ProxyOpt) -> ClientConfig 
         danger: true,
         keepalive: Duration::from_secs(5),
         timeout: Duration::from_secs(5),
+        wire: WireApi::Legacy,
     }
 }
 
@@ -409,4 +423,128 @@ async fn bin_throughput_batch() {
         "throughput was zero: {v}"
     );
     assert!(v["reconnects"].is_number());
+}
+
+// ---------------------------------------------------------------------------
+// v1 API: fixed routes, bearer auth, session limit
+// ---------------------------------------------------------------------------
+
+fn v1_client_config(server_port: u16, mode: Mode, token: Option<String>) -> ClientConfig {
+    ClientConfig {
+        server: format!("https://127.0.0.1:{server_port}"),
+        mode,
+        proxy: ProxyOpt::Direct,
+        danger: true,
+        keepalive: Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
+        wire: WireApi::V1 { token },
+    }
+}
+
+/// v1 client -> fixed route id -> server-side TCP target, with a bearer token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_tcp_roundtrip_via_route() {
+    let target = spawn_echo_target().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.auth_token = Some("s3cret".into());
+    cfg.allow_legacy = false;
+    cfg.routes = vec![Route {
+        id: "t1".into(),
+        transport: Transport::Tcp,
+        target: target.to_string(),
+    }];
+    let sport = spawn_server_with(cfg).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cport = listener.local_addr().unwrap().port();
+    let client = v1_client_config(sport, Mode::Batch, Some("s3cret".into()));
+    tokio::spawn(async move {
+        let _ = run_tcp_mapping_on(listener, "t1".into(), client).await;
+    });
+
+    let mut stream = TcpStream::connect(("127.0.0.1", cport)).await.unwrap();
+    stream.write_all(b"via-route").await.unwrap();
+    let mut got = [0u8; 9];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut got))
+        .await
+        .expect("v1 route response timed out")
+        .unwrap();
+    assert_eq!(&got, b"via-route");
+}
+
+/// A raw HTTP probe of the v1 API: missing token -> 401, unknown route -> 400,
+/// known route -> 200, over the cap -> 429, and legacy path gone -> 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_enforces_auth_route_and_limit() {
+    let target = spawn_echo_target().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.auth_token = Some("s3cret".into());
+    cfg.allow_legacy = false;
+    cfg.max_sessions = 2;
+    cfg.routes = vec![Route {
+        id: "t1".into(),
+        transport: Transport::Tcp,
+        target: target.to_string(),
+    }];
+    let sport = spawn_server_with(cfg).await;
+    let base = format!("https://127.0.0.1:{sport}");
+
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    // No Authorization -> 401.
+    let r = http
+        .post(format!("{base}/api/v1/session/open?s=a&r=t1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401, "missing token must be rejected");
+
+    // Authenticated but unknown route -> 400 (arbitrary target refused).
+    let r = http
+        .post(format!("{base}/api/v1/session/open?s=b&r=bogus"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "unknown route must be rejected");
+
+    // Known route -> 200 (session #1).
+    let r = http
+        .post(format!("{base}/api/v1/session/open?s=c&r=t1"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    // Session #2 fills the cap.
+    let r = http
+        .post(format!("{base}/api/v1/session/open?s=d&r=t1"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    // Over the cap -> 429.
+    let r = http
+        .post(format!("{base}/api/v1/session/open?s=e&r=t1"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 429, "session limit must be enforced");
+
+    // Legacy path is gone when allow_legacy is false.
+    let r = http
+        .post(format!("{base}/o?s=f"))
+        .header("x-target", "tcp://127.0.0.1:1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404, "legacy API must be disabled");
 }

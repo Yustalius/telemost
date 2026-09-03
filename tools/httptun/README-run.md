@@ -192,3 +192,76 @@ target/debug/relay-probe --role ping --relay-server 201.24.52.171:21117 \
 ```
 
 `echo_ok:true` = связь клиент↔сервер через HTTP-batch работает end-to-end.
+
+## O1 — TLS-метаданные: домен, публичный серт, `/api/v1`, токен
+
+Фаза O1 снимает самые громкие отпечатки туннеля: клиент ходит на реальный домен
+`ya-telemost.site` (A → `201.24.52.171`) с валидным SNI и публично доверенным
+сертификатом (проверка включена, `danger:false`), запросы идут под браузерными
+заголовками на пути `/api/v1/session/{open,send,recv,close}`, произвольный
+`X-Target` заменён четырьмя фиксированными route ID, а API защищён общим
+bearer-токеном и лимитом сессий.
+
+Route ID (клиент шлёт только их, `host:port` знает лишь сервер):
+
+| Route | Транспорт | Target на VPS |
+|---|---|---|
+| `ru` | UDP | `127.0.0.1:21116` (rendezvous) |
+| `rt` | TCP | `127.0.0.1:21116` (rendezvous) |
+| `nt` | TCP | `127.0.0.1:21115` (NAT-test) |
+| `rl` | TCP | `<relay-host>:21117` (relay, публичный IP) |
+
+Домен и токен зашиты в клиент: `HTTP_TUNNEL_SERVER_HOST` и
+`HTTP_TUNNEL_AUTH_TOKEN` в `libs/hbb_common/src/config.rs`. Сервер должен
+стартовать с тем же `--auth-token`.
+
+### Сертификат Let's Encrypt (IPv4, без AAAA)
+
+```bash
+# DNS: ya-telemost.site A 201.24.52.171 должен стабильно резолвиться
+certbot certonly --standalone -d ya-telemost.site
+# fullchain.pem + privkey.pem в /etc/letsencrypt/live/ya-telemost.site/
+certbot renew --dry-run
+```
+
+### systemd ExecStart на VPS
+
+```bash
+/opt/httptun/httptun-server \
+  --listen 0.0.0.0:443 \
+  --tls-cert /etc/letsencrypt/live/ya-telemost.site/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/ya-telemost.site/privkey.pem \
+  --auth-token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 \
+  --relay-host 201.24.52.171 \
+  --max-sessions 256 \
+  --allow-legacy \
+  -v
+```
+
+`--allow-legacy` оставляем только на время миграции (старый клиент ещё ходит на
+`/o /u /d /c` + `X-Target`). После выката пилотного клиента флаг убираем и
+рестартуем — legacy-пути начинают отдавать `404`.
+
+### Проверка
+
+```bash
+# валидный серт, без -k
+curl -4 https://ya-telemost.site/            # decoy-страница, TLS доверенный
+# без токена -> 401
+curl -4 -s -o /dev/null -w '%{http_code}\n' \
+  -X POST 'https://ya-telemost.site/api/v1/session/open?s=x&r=rt'
+# произвольный/неизвестный route -> 400
+curl -4 -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Authorization: Bearer tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56' \
+  -X POST 'https://ya-telemost.site/api/v1/session/open?s=x&r=bogus'
+```
+
+Изолированная проверка транспорта клиентом (v1 — режим по умолчанию):
+
+```bash
+target/release/httptun-client --telemost-preset ya-telemost.site \
+  --token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 --mode batch -v
+# legacy (для сравнения / старого сервера):
+target/release/httptun-client --telemost-preset 201.24.52.171 \
+  --legacy --mode batch --no-proxy --danger-accept-invalid-cert -v
+```

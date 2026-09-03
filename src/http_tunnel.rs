@@ -2,11 +2,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hbb_common::{
-    anyhow::{anyhow, Result},
-    config::RENDEZVOUS_SERVERS,
+    anyhow::Result,
+    config::{HTTP_TUNNEL_AUTH_TOKEN, HTTP_TUNNEL_SERVER_HOST},
     log, tokio,
 };
-use httptun::{start_mappings, telemost_preset_maps, ClientConfig, Mode, ProxyOpt};
+use httptun::{start_mappings, telemost_preset_maps_v1, ClientConfig, Mode, ProxyOpt, WireApi};
 
 const MAX_START_ATTEMPTS: u32 = 10;
 const MAX_RETRY_DELAY_SECS: u64 = 5;
@@ -47,24 +47,23 @@ pub async fn start() -> bool {
 }
 
 async fn start_inner() -> Result<()> {
-    let host = RENDEZVOUS_SERVERS
-        .first()
-        .ok_or_else(|| anyhow!("no rendezvous server configured"))?;
-    let server = if host.contains(':') {
-        format!("https://[{host}]:443")
-    } else {
-        format!("https://{host}:443")
-    };
+    // Dial the real domain so TLS carries a valid SNI and publicly-trusted cert
+    // (O1). Port 443 is implicit for https, matching an ordinary web app.
+    let server = format!("https://{HTTP_TUNNEL_SERVER_HOST}");
     let config = ClientConfig {
         server,
         mode: Mode::Batch,
         proxy: ProxyOpt::Env,
-        // The current VPS endpoint generates its own certificate at startup.
-        danger: true,
+        // The VPS now serves a publicly-trusted certificate for the domain, so
+        // validate it (no bare-IP, no self-signed acceptance).
+        danger: false,
         keepalive: Duration::from_secs(15),
         timeout: Duration::from_secs(30),
+        wire: WireApi::V1 {
+            token: Some(HTTP_TUNNEL_AUTH_TOKEN.to_owned()),
+        },
     };
-    let task = start_mappings(config, telemost_preset_maps(host)).await?;
+    let task = start_mappings(config, telemost_preset_maps_v1()).await?;
     log::info!("HTTP batch tunnel is ready on 127.0.0.1:23455-23457");
     tokio::spawn(async move {
         match task.await {

@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use httptun::{run_server, Mode, ServerConfig};
+use httptun::{run_server, telemost_preset_routes, Mode, ServerConfig};
 
 /// HTTP-streaming tunnel server: bridges each HTTP session to a TCP or UDP target
 /// (from the `X-Target` header) or to a built-in echo responder.
@@ -34,8 +35,33 @@ struct Args {
     poll_wait_sec: u64,
 
     /// Extra Subject Alternative Names for the self-signed cert (repeatable).
+    /// Ignored when --tls-cert/--tls-key provide a real certificate.
     #[arg(long = "san", value_name = "HOST")]
     sans: Vec<String>,
+
+    /// PEM certificate chain (e.g. Let's Encrypt fullchain.pem). Requires --tls-key.
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key paired with --tls-cert.
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
+
+    /// Shared bearer token required on every /api/v1/* request.
+    #[arg(long, value_name = "TOKEN")]
+    auth_token: Option<String>,
+
+    /// Maximum concurrent sessions before /api/v1/session/open returns 429.
+    #[arg(long, default_value_t = 256)]
+    max_sessions: usize,
+
+    /// Also accept the legacy /o /u /d /c + X-Target API (migration only).
+    #[arg(long)]
+    allow_legacy: bool,
+
+    /// Public host the relay route dials (hbbr rejects loopback-origin relays).
+    #[arg(long, default_value = "201.24.52.171")]
+    relay_host: String,
 
     /// -v debug, -vv trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -62,6 +88,12 @@ async fn main() -> anyhow::Result<()> {
         timeout: Duration::from_secs(args.timeout_sec.max(1)),
         poll_wait: Duration::from_secs(args.poll_wait_sec.max(1)),
         sans,
+        tls_cert: args.tls_cert.clone(),
+        tls_key: args.tls_key.clone(),
+        auth_token: args.auth_token.clone(),
+        max_sessions: args.max_sessions,
+        allow_legacy: args.allow_legacy,
+        routes: telemost_preset_routes(&args.relay_host),
     };
     run_server(cfg).await
 }
