@@ -924,6 +924,13 @@ fn spawn_udp_bridge(
             tokio::select! {
                 result = socket.recv(&mut buf) => match result {
                     Ok(n) => {
+                        // An empty datagram would encode as len=0, colliding with
+                        // the keepalive frame and getting dropped by the decoder
+                        // (and tripping encode_data's debug_assert). Skip it, as
+                        // the client-side listener already does.
+                        if n == 0 {
+                            continue;
+                        }
                         if down_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
                             break;
                         }
@@ -1154,6 +1161,10 @@ struct TunnelCtx {
     server: String,
     mode: Mode,
     keepalive: Duration,
+    // Per-request bound for the finite requests (open / batch send / close /
+    // batch recv). Not applied to the long-lived stream bodies, which are
+    // infinite by design; a buffering proxy could otherwise hang them forever.
+    timeout: Duration,
     wire: WireApi,
 }
 
@@ -1211,6 +1222,7 @@ impl TunnelSender {
                     .client
                     .post(&url)
                     .body(encode_data(&data))
+                    .timeout(self.ctx.timeout)
                     .send()
                     .await
                     .context("batch upstream POST")?;
@@ -1238,7 +1250,14 @@ impl TunnelSender {
                     self.sid,
                     n
                 );
-                let _ = self.ctx.client.post(&url).body(encode_close()).send().await;
+                let _ = self
+                    .ctx
+                    .client
+                    .post(&url)
+                    .body(encode_close())
+                    .timeout(self.ctx.timeout)
+                    .send()
+                    .await;
             }
         }
         let url = format!(
@@ -1247,7 +1266,13 @@ impl TunnelSender {
             self.ctx.wire.close_path(),
             self.sid
         );
-        let _ = self.ctx.client.post(&url).send().await;
+        let _ = self
+            .ctx
+            .client
+            .post(&url)
+            .timeout(self.ctx.timeout)
+            .send()
+            .await;
         self.closed.store(true, Relaxed);
     }
 }
@@ -1273,7 +1298,11 @@ async fn open_tunnel(
             ctx.client.post(&open_url).header("x-target", target)
         }
     };
-    let resp = open.send().await.context("open session")?;
+    let resp = open
+        .timeout(ctx.timeout)
+        .send()
+        .await
+        .context("open session")?;
     if !resp.status().is_success() {
         bail!(
             "server refused session for {target}: {} {}",
@@ -1427,6 +1456,11 @@ async fn down_driver_stream(
     closed.store(true, Relaxed);
 }
 
+// Reconnect backoff for the batch downstream long-poll: start small, double on
+// each consecutive failure, cap so a long proxy outage stops hammering it.
+const DOWN_BACKOFF_MIN: Duration = Duration::from_millis(200);
+const DOWN_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 async fn down_driver_batch(
     ctx: Arc<TunnelCtx>,
     sid: String,
@@ -1435,10 +1469,11 @@ async fn down_driver_batch(
     closed: Arc<AtomicBool>,
 ) {
     let mut seq = 0u64;
+    let mut backoff = DOWN_BACKOFF_MIN;
     while !closed.load(Relaxed) {
         let url = format!("{}{}?s={}&seq={}", ctx.server, ctx.wire.recv_path(), sid, seq);
         seq += 1;
-        let resp = match ctx.client.get(&url).send().await {
+        let resp = match ctx.client.get(&url).timeout(ctx.timeout).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 log::debug!("batch downstream status {}", r.status());
@@ -1447,7 +1482,8 @@ async fn down_driver_batch(
             Err(e) => {
                 log::debug!("batch downstream error: {e}");
                 reconnects.fetch_add(1, Relaxed);
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(DOWN_BACKOFF_MAX);
                 continue;
             }
         };
@@ -1456,10 +1492,12 @@ async fn down_driver_batch(
             Err(e) => {
                 log::debug!("batch downstream body error: {e}");
                 reconnects.fetch_add(1, Relaxed);
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(DOWN_BACKOFF_MAX);
                 continue;
             }
         };
+        backoff = DOWN_BACKOFF_MIN;
         let mut dec = FrameDecoder::new();
         dec.push(&body);
         let mut clean_close = false;
@@ -1534,8 +1572,10 @@ fn ctx_from(cfg: &ClientConfig) -> Result<Arc<TunnelCtx>> {
         server: cfg.server.trim_end_matches('/').to_owned(),
         mode: cfg.mode,
         keepalive: cfg.keepalive,
+        // Applied both as reqwest connect_timeout (build_client) and as the
+        // per-request timeout on the finite requests below.
+        timeout: cfg.timeout,
         wire: cfg.wire.clone(),
-        // cfg.timeout is applied as reqwest connect_timeout in build_client.
     }))
 }
 
@@ -2162,6 +2202,19 @@ mod tests {
             dec.next_frame(),
             Some(TunFrame::Data(Bytes::from_static(b"xyz!")))
         );
+        assert_eq!(dec.next_frame(), None);
+    }
+
+    #[test]
+    fn empty_datagram_would_collide_with_keepalive() {
+        // A zero-length payload framed as data ([0,0,0,0]) is byte-identical to
+        // a keepalive, so the decoder reports KeepAlive and the datagram is lost.
+        // This is why both UDP bridges must drop n==0 reads instead of forwarding
+        // them (server: spawn_udp_bridge; client: serve_udp_mapping).
+        assert_eq!(&encode_keepalive()[..], &[0u8, 0, 0, 0]);
+        let mut dec = FrameDecoder::new();
+        dec.push(&[0, 0, 0, 0]); // what encode_data(b"") would produce
+        assert_eq!(dec.next_frame(), Some(TunFrame::KeepAlive));
         assert_eq!(dec.next_frame(), None);
     }
 
