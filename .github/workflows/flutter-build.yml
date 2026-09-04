@@ -44,7 +44,7 @@ env:
   # 2. Update the `VCPKG_COMMIT_ID` in `ci.yml` and `playground.yml`.
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836" # 2025.01.13, got "/opt/artifacts/vcpkg/vcpkg: No such file or directory" with latest version
-  VERSION: "1.4.9"
+  VERSION: "1.5.0"
   NDK_VERSION: "r28c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
@@ -839,8 +839,12 @@ jobs:
           cargo -V
           rustc -V
 
+      - name: Self-test macOS release audit
+        run: ./tools/test-macos-audit-release.sh
+
       - name: Build telemost
         run: |
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${GITHUB_WORKSPACE}=."
           if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
             MIN_MACOS_VERSION="12.3"
             sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
@@ -849,6 +853,21 @@ jobs:
             sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
           fi
           ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
+
+      - name: Audit macOS release bundle
+        run: ./tools/macos-audit-release.sh ./flutter/build/macos/Build/Products/Release/Telemost.app
+
+      - name: Upload macOS debug symbols
+        if: always() && env.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemost-macos-debug-symbols-${{ matrix.job.arch }}
+          path: |
+            target/flutter-symbols/macos-${{ matrix.job.arch }}/
+            target/release/*.dSYM/
+            flutter/build/macos/Build/Products/Release/**/*.dSYM/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: create unsigned dmg
         if: env.UPLOAD_ARTIFACT == 'true'

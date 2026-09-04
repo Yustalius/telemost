@@ -281,7 +281,7 @@ fn heartbeat_url() -> String {
     if url.is_empty() || crate::is_public(&url) {
         return "".to_owned();
     }
-    format!("{}/api/heartbeat", url)
+    format!("{}/api/{}", url, "heartbeat")
 }
 
 fn handle_config_options(config_options: HashMap<String, String>) {

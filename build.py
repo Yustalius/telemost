@@ -13,6 +13,7 @@ import re
 import subprocess
 import argparse
 import sys
+import shlex
 from pathlib import Path
 
 # Captured at import, while cwd is still the repo root: before Python 3.9 the main script's __file__
@@ -53,6 +54,14 @@ def system2(cmd):
     if exit_code != 0:
         sys.stderr.write(f"Error occurred when executing: `{cmd}`. Exiting.\n")
         sys.exit(-1)
+
+
+def rustflags_with_workspace_remap():
+    existing = os.environ.get('RUSTFLAGS', '').strip()
+    remap = f'--remap-path-prefix={REPO_ROOT}=.'
+    if remap in existing:
+        return existing
+    return f'{existing} {remap}'.strip()
 
 
 def get_version():
@@ -894,8 +903,10 @@ def build_deb_from_folder(version, binary_folder, want_drm=False):
 def build_flutter_dmg(version, features):
     if not skip_cargo:
         # set minimum osx build target, now is 10.14, which is the same as the flutter xcode project
+        rustflags = shlex.quote(rustflags_with_workspace_remap())
         system2(
-            f'MACOSX_DEPLOYMENT_TARGET=10.14 cargo build --locked --features {features} --release')
+            f'RUSTFLAGS={rustflags} MACOSX_DEPLOYMENT_TARGET=10.14 '
+            f'cargo build --locked --features {features} --release')
     # copy dylib
     system2(
         "cp target/release/liblibtelemost.dylib target/release/libtelemost.dylib")
@@ -906,9 +917,16 @@ def build_flutter_dmg(version, features):
     # so the universal-by-default ARCHS_STANDARD doesn't try to link a missing slice.
     # FLUTTER_XCODE_* env vars are forwarded to xcodebuild as build settings.
     mac_arch = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
+    symbol_arch = 'aarch64' if mac_arch == 'arm64' else mac_arch
+    split_debug_info = f'../target/flutter-symbols/macos-{symbol_arch}'
     system2(
-        f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release')
+        f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES '
+        f'flutter build macos --release --obfuscate --split-debug-info={split_debug_info}')
     system2('cp -f ../target/release/service ./build/macos/Build/Products/Release/Telemost.app/Contents/MacOS/TelemostService')
+    licenses_dir = './build/macos/Build/Products/Release/Telemost.app/Contents/Resources/licenses'
+    os.makedirs(licenses_dir, exist_ok=True)
+    shutil.copy2(os.path.join(REPO_ROOT, 'LICENCE'),
+                 os.path.join(licenses_dir, 'AGPL-3.0.txt'))
     '''
     system2(
         "create-dmg --volname \"Telemost Installer\" --window-pos 200 120 --window-size 800 400 --icon-size 100 --app-drop-link 600 185 --icon Telemost.app 200 190 --hide-extension Telemost.app telemost.dmg ./build/macos/Build/Products/Release/Telemost.app")

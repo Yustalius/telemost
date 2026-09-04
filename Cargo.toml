@@ -1,7 +1,7 @@
 [package]
 name = "telemost"
 version = "1.5.0"
-authors = ["telemost <info@rustdesk.com>"]
+authors = ["Telemost Team"]
 edition = "2021"
 build= "build.rs"
 description = "Telemost Remote Desktop"
@@ -245,6 +245,7 @@ osx_minimum_system_version = "10.14"
 
 #https://github.com/johnthagen/min-sized-rust
 [profile.release]
+debug = 0
 lto = true
 codegen-units = 1
 panic = 'abort'

@@ -1655,7 +1655,7 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
         debugPrint('API server is empty, cannot update audit note');
         return;
       }
-      final url = '$apiServer/api/audit';
+      final url = [apiServer, 'api', 'audit'].join('/');
       var headers = getHttpHeaders();
       headers['Content-Type'] = "application/json";
       final body = jsonEncode({

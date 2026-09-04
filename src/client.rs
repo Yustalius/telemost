@@ -117,7 +117,7 @@ pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
 pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
     "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
-pub const SCRAP_X11_REF_URL: &str = "https://telemost.example/docs/en/manual/linux/#x11-required";
+pub const SCRAP_X11_REF_URL: &str = "";
 
 #[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
@@ -901,7 +901,7 @@ impl Client {
         ipv4: bool,
     ) -> ResultType<Stream> {
         if config::is_http_tunnel_enabled() {
-            relay_server = config::HTTP_TUNNEL_RELAY_SERVER.to_owned();
+            relay_server = config::http_tunnel_relay_server();
         }
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
@@ -3349,7 +3349,7 @@ lazy_static::lazy_static! {
             msgtype: "error",
             title: "Login Error",
             text: "Login screen using Wayland is not supported",
-            link: "https://telemost.example/docs/en/manual/linux/#login-screen",
+            link: "",
             try_again: true,
         }), (LOGIN_MSG_NO_PASSWORD_ACCESS, LoginErrorMsgBox{
             msgtype: "wait-remote-accept-nook",

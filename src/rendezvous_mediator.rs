@@ -841,7 +841,7 @@ impl RendezvousMediator {
 
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
         if config::is_http_tunnel_enabled() {
-            return config::HTTP_TUNNEL_RELAY_SERVER.to_owned();
+            return config::http_tunnel_relay_server();
         }
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {

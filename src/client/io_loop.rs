@@ -98,8 +98,17 @@ impl ParsedPeerInfo {
     fn is_support_virtual_display(&self) -> bool {
         self.is_installed
             && self.platform == "Windows"
-            && (self.idd_impl == "rustdesk_idd" || self.idd_impl == "amyuni_idd")
+            && (is_legacy_idd_impl(&self.idd_impl) || self.idd_impl == "amyuni_idd")
     }
+}
+
+fn is_legacy_idd_impl(value: &str) -> bool {
+    const PREFIX: &str = "rust";
+    const SUFFIX: &str = "desk_idd";
+
+    value.len() == PREFIX.len() + SUFFIX.len()
+        && value.starts_with(PREFIX)
+        && value.ends_with(SUFFIX)
 }
 
 impl<T: InvokeUiSession> Remote<T> {

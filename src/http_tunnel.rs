@@ -64,7 +64,7 @@ async fn start_inner() -> Result<()> {
         },
     };
     let task = start_mappings(config, telemost_preset_maps_v1()).await?;
-    log::info!("HTTP batch tunnel is ready on 127.0.0.1:23455-23457");
+    log::info!("HTTP batch tunnel is ready");
     tokio::spawn(async move {
         match task.await {
             Ok(Ok(())) => log::warn!("HTTP batch tunnel stopped"),

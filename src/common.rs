@@ -1090,7 +1090,7 @@ fn get_api_server_(api: String, custom: String) -> String {
             return format!("http://{}", s);
         }
     }
-    // Telemost: раньше здесь был admin.rustdesk.com.
+    // Telemost has no default management API.
     "".to_owned()
 }
 
@@ -1104,7 +1104,7 @@ pub fn is_public(url: &str) -> bool {
         return false;
     };
     let host = host.strip_suffix('.').unwrap_or(host);
-    host == "rustdesk.com" || host.ends_with(".rustdesk.com")
+    host.eq_ignore_ascii_case(config::HTTP_TUNNEL_SERVER_HOST)
 }
 
 pub fn get_udp_punch_enabled() -> bool {
@@ -1138,7 +1138,7 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
     if url.is_empty() || is_public(&url) {
         return "".to_owned();
     }
-    format!("{}/api/audit/{}", url, typ)
+    format!("{}/api/{}/{}", url, "audit", typ)
 }
 
 /// Check if we should use raw TCP proxy for API calls.
@@ -2873,37 +2873,27 @@ mod tests {
 
     #[test]
     fn test_is_public() {
-        // Test URLs containing "rustdesk.com/"
-        assert!(is_public("https://rustdesk.com/"));
-        assert!(is_public("https://www.rustdesk.com/"));
-        assert!(is_public("https://api.rustdesk.com/v1"));
-        assert!(is_public("https://API.RUSTDESK.COM/v1"));
-        assert!(is_public("https://rustdesk.com/path"));
-
-        // Test URLs ending with "rustdesk.com"
-        assert!(is_public("rustdesk.com"));
-        assert!(is_public("https://rustdesk.com"));
-        assert!(is_public("https://RustDesk.com"));
-        assert!(is_public("http://www.rustdesk.com"));
-        assert!(is_public("https://api.rustdesk.com"));
+        assert!(is_public("https://ya-telemost.site/"));
+        assert!(is_public("https://YA-TELEMOST.SITE/v1"));
+        assert!(is_public("ya-telemost.site"));
+        assert!(is_public("ya-telemost.site:443"));
 
         // Test non-public URLs
         assert!(!is_public("https://example.com"));
         assert!(!is_public("https://custom-server.com"));
         assert!(!is_public("http://192.168.1.1"));
         assert!(!is_public("localhost"));
-        assert!(!is_public("https://rustdesk.computer.com"));
-        assert!(!is_public("rustdesk.comhello.com"));
+        assert!(!is_public("https://subdomain.ya-telemost.site"));
+        assert!(!is_public("ya-telemost.site.example.com"));
     }
 
     #[test]
     fn test_is_public_matches_telemost_root_domain() {
-        assert!(is_public("rustdesk.com/"));
-        assert!(is_public("rustdesk.com:21117"));
-        assert!(is_public("api.rustdesk.com:21117"));
-        assert!(!is_public("hello-rustdesk.com"));
-        assert!(!is_public("api.rustdesk.com.evil.test"));
-        assert!(!is_public("https://rustdesk.com@evil.test"));
+        assert!(is_public("ya-telemost.site/"));
+        assert!(is_public("ya-telemost.site:443"));
+        assert!(!is_public("hello-ya-telemost.site"));
+        assert!(!is_public("api.ya-telemost.site"));
+        assert!(!is_public("https://ya-telemost.site@evil.test"));
     }
 
     #[test]
@@ -2921,8 +2911,8 @@ mod tests {
             "https://admin.example.com"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
-            "https://admin.rustdesk.com/api/login",
-            "https://admin.rustdesk.com"
+            "https://ya-telemost.site/api/login",
+            "https://ya-telemost.site"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
             "https://admin.example.com/api/login",
