@@ -8340,7 +8340,7 @@ dependencies = [
 
 [[package]]
 name = "telemost"
-version = "1.4.9"
+version = "1.5.0"
 dependencies = [
  "android-wakelock",
  "android_logger",

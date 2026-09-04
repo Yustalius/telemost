@@ -1,6 +1,6 @@
 [package]
 name = "telemost"
-version = "1.4.9"
+version = "1.5.0"
 authors = ["telemost <info@rustdesk.com>"]
 edition = "2021"
 build= "build.rs"
@@ -239,7 +239,7 @@ docopt = "1.1"
 
 [package.metadata.bundle]
 name = "Telemost"
-identifier = "com.carriez.telemost"
+identifier = "com.telemost.desktop"
 icon = ["res/32x32.png", "res/128x128.png", "res/128x128@2x.png"]
 osx_minimum_system_version = "10.14"
 

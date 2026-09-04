@@ -8,7 +8,4 @@
 PRODUCT_NAME = Telemost
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.carriez.flutterHbb
-
-// The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved.
+PRODUCT_BUNDLE_IDENTIFIER = com.telemost.desktop
