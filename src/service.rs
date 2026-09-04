@@ -5,7 +5,7 @@ fn main() {}
 
 #[cfg(target_os = "macos")]
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = libtelemost::common::process_args().collect();
     if args.len() > 1 && args[1] == "--write-plists" {
         if let Err(e) = libtelemost::platform::write_plists() {
             eprintln!("Failed to write plists: {}", e);

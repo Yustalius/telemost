@@ -47,7 +47,7 @@ pub fn core_main() -> Option<Vec<String>> {
     let mut _is_flutter_invoke_new_connection = false;
     let mut no_server = false;
     let mut arg_exe = Default::default();
-    for arg in std::env::args() {
+    for arg in crate::process_args() {
         if i == 0 {
             arg_exe = arg;
         } else if i > 0 {
@@ -117,7 +117,7 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     #[cfg(feature = "flutter")]
     if _is_flutter_invoke_new_connection {
-        return core_main_invoke_new_connection(std::env::args());
+        return core_main_invoke_new_connection(crate::process_args());
     }
     let click_setup = cfg!(windows) && args.is_empty() && crate::common::is_setup(&arg_exe);
     if click_setup && !config::is_disable_installation() {
@@ -768,7 +768,7 @@ fn import_config(path: &str) {
 /// If it returns [`None`], then the process will terminate, and flutter gui will not be started.
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(feature = "flutter")]
-fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<String>> {
+fn core_main_invoke_new_connection(mut args: impl Iterator<Item = String>) -> Option<Vec<String>> {
     let mut authority = None;
     let mut id = None;
     let mut param_array = vec![];

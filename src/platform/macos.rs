@@ -1925,7 +1925,7 @@ fn get_server_start_time(sys: &mut System, path: &Path) -> Option<(i64, Pid)> {
 
 pub fn handle_application_should_open_untitled_file() {
     hbb_common::log::debug!("icon clicked on finder");
-    let x = std::env::args().nth(1).unwrap_or_default();
+    let x = crate::process_args().nth(1).unwrap_or_default();
     if x == "--server" || x == "--cm" || x == "--tray" {
         std::thread::spawn(move || crate::handle_url_scheme("".to_lowercase()));
     }

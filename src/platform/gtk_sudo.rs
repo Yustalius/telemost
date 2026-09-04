@@ -41,7 +41,7 @@ enum Message {
 
 pub fn run(cmds: Vec<&str>) -> ResultType<()> {
     // telemost service kill `telemost --` processes
-    let second_arg = std::env::args().nth(1).unwrap_or_default();
+    let second_arg = crate::process_args().nth(1).unwrap_or_default();
     let cmd_mode =
         second_arg.starts_with("--") && second_arg != "--tray" && second_arg != "--no-server";
     let mod_arg = if cmd_mode { "cmd" } else { "gui" };
@@ -58,10 +58,10 @@ pub fn run(cmds: Vec<&str>) -> ResultType<()> {
 
 pub fn exec() {
     let mut args = vec![];
-    for arg in std::env::args().skip(3) {
+    for arg in crate::process_args().skip(3) {
         args.push(arg);
     }
-    let cmd_mode = std::env::args().nth(2) == Some("cmd".to_string());
+    let cmd_mode = crate::process_args().nth(2) == Some("cmd".to_string());
     if cmd_mode {
         cmd(args);
     } else {

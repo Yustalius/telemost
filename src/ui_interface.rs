@@ -126,7 +126,7 @@ pub fn run_without_install() {
 
 #[inline]
 pub fn show_run_without_install() -> bool {
-    let mut it = std::env::args();
+    let mut it = crate::process_args();
     if let Some(tmp) = it.next() {
         if crate::is_setup(&tmp) {
             return it.next() == None;

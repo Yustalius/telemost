@@ -101,11 +101,19 @@ lazy_static::lazy_static! {
 
 lazy_static::lazy_static! {
     // Is server process, with "--server" args
-    static ref IS_SERVER: bool = std::env::args().nth(1) == Some("--server".to_owned());
+    static ref IS_SERVER: bool = process_args().nth(1) == Some("--server".to_owned());
     // Is server logic running. The server code can invoked to run by the main process if --server is not running.
     static ref SERVER_RUNNING: Arc<RwLock<bool>> = Default::default();
-    static ref IS_MAIN: bool = std::env::args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
-    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned());
+    static ref IS_MAIN: bool = process_args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
+    static ref IS_CM: bool = process_args().nth(1) == Some("--cm".to_owned());
+}
+
+pub fn process_args() -> impl Iterator<Item = String> {
+    hbb_common::without_diagnostic_log_arg(std::env::args())
+}
+
+pub fn process_args_os() -> impl Iterator<Item = std::ffi::OsString> {
+    std::env::args_os().filter(|arg| arg != std::ffi::OsStr::new(hbb_common::DIAGNOSTIC_LOG_ARG))
 }
 
 pub struct SimpleCallOnReturn {

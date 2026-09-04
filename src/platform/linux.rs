@@ -4,9 +4,9 @@ pub use hbb_common::platform::linux::*;
 
 #[cfg(feature = "drm")]
 pub fn dispatch_wayland_display_probe() {
-    use std::ffi::OsStr;
-
-    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WAYLAND_DISPLAY_PROBE_ARG)) {
+    if crate::process_args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(WAYLAND_DISPLAY_PROBE_ARG))
+    {
         wayland_display_probe_child_main();
     }
 }
