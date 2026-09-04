@@ -91,11 +91,11 @@ fn macos_service_ipc_allows_gui_and_service_binaries(
         return false;
     }
 
-    // On installed macOS builds, `_service` is listened by the `service` binary while the GUI
+    // On installed macOS builds, `_service` is listened by the `TelemostService` binary while the GUI
     // process connects from the app executable within the same app bundle.
     let gui_exe_name = std::ffi::OsString::from(crate::get_app_name());
     let gui_exe = gui_exe_name.as_os_str();
-    let service_exe = std::ffi::OsStr::new("service");
+    let service_exe = std::ffi::OsStr::new("TelemostService");
     let allowed_exe = [Some(gui_exe), Some(service_exe)];
     let peer_name = peer_exe.file_name();
     let current_name = current_exe.file_name();
@@ -1030,7 +1030,23 @@ mod tests {
         ));
         assert!(!super::os_str_eq_ignore_ascii_case(
             Some(std::ffi::OsStr::new("Telemost")),
-            Some(std::ffi::OsStr::new("service"))
+            Some(std::ffi::OsStr::new("TelemostService"))
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_service_ipc_accepts_bundled_helper() {
+        let app_dir = std::path::Path::new("/Applications/Telemost.app/Contents/MacOS");
+        assert!(super::macos_service_ipc_allows_gui_and_service_binaries(
+            &app_dir.join("Telemost"),
+            &app_dir.join("TelemostService"),
+            crate::POSTFIX_SERVICE,
+        ));
+        assert!(!super::macos_service_ipc_allows_gui_and_service_binaries(
+            &app_dir.join("Telemost"),
+            &app_dir.join("service"),
+            crate::POSTFIX_SERVICE,
         ));
     }
 

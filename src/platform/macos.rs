@@ -42,6 +42,12 @@ static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
 static mut LATEST_SEED: i32 = 0;
 
+const MACOS_DAEMON_LABEL: &str = "com.telemost.desktop.service";
+const MACOS_AGENT_LABEL: &str = "com.telemost.desktop.agent";
+const MACOS_DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.telemost.desktop.service.plist";
+const MACOS_AGENT_PLIST: &str = "/Library/LaunchAgents/com.telemost.desktop.agent.plist";
+const MACOS_SERVICE_EXECUTABLE: &str = "TelemostService";
+
 #[inline]
 fn get_update_temp_dir() -> PathBuf {
     let euid = unsafe { hbb_common::libc::geteuid() };
@@ -118,7 +124,7 @@ pub fn is_can_screen_recording(prompt: bool) -> bool {
 
 // macOS >= 10.15
 // https://stackoverflow.com/questions/56597221/detecting-screen-recording-settings-on-macos-catalina/
-// remove just one app from all the permissions: tccutil reset All com.carriez.telemost
+// remove just one app from all the permissions: tccutil reset All com.telemost.desktop
 fn unsafe_is_can_screen_recording(prompt: bool) -> bool {
     // we got some report that we show no permission even after set it, so we try to use new api for screen recording check
     // the new api is only available on macOS >= 10.15, but on stackoverflow, some people said it works on >= 10.16 (crash on 10.15),
@@ -187,12 +193,10 @@ pub fn install_service() -> bool {
 // No need to merge the existing dup code, because the code in these two functions are too critical.
 // New code should be written in a common function.
 pub fn is_installed_daemon(prompt: bool) -> bool {
-    let daemon = format!("{}_service.plist", crate::get_full_name());
-    let agent = format!("{}_server.plist", crate::get_full_name());
-    let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
+    let agent_plist_file = MACOS_AGENT_PLIST.to_owned();
     if !prompt {
         // in macos 13, there is new way to check if they are running or enabled, https://developer.apple.com/documentation/servicemanagement/updating-helper-executables-from-earlier-versions-of-macos#Respond-to-changes-in-System-Settings
-        if !std::path::Path::new(&format!("/Library/LaunchDaemons/{}", daemon)).exists() {
+        if !std::path::Path::new(MACOS_DAEMON_PLIST).exists() {
             return false;
         }
         if !std::path::Path::new(&agent_plist_file).exists() {
@@ -204,21 +208,21 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     let Some(install_script) = PRIVILEGES_SCRIPTS_DIR.get_file("install.scpt") else {
         return false;
     };
-    let Some(install_script_body) = install_script.contents_utf8().map(correct_app_name) else {
+    let Some(install_script_body) = install_script.contents_utf8().map(str::to_owned) else {
         return false;
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         return false;
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(str::to_owned) else {
         return false;
     };
 
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         return false;
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(str::to_owned) else {
         return false;
     };
 
@@ -255,20 +259,20 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
     let Some(update_script) = PRIVILEGES_SCRIPTS_DIR.get_file(update_script_file) else {
         return;
     };
-    let Some(update_script_body) = update_script.contents_utf8().map(correct_app_name) else {
+    let Some(update_script_body) = update_script.contents_utf8().map(str::to_owned) else {
         return;
     };
 
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         return;
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(str::to_owned) else {
         return;
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         return;
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(str::to_owned) else {
         return;
     };
 
@@ -302,16 +306,6 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
     }
 }
 
-fn correct_app_name(s: &str) -> String {
-    let mut s = s.to_owned();
-    if let Some(bundleid) = get_bundle_id() {
-        s = s.replace("com.carriez.telemost", &bundleid);
-    }
-    s = s.replace("telemost", &crate::get_app_name().to_lowercase());
-    s = s.replace("Telemost", &crate::get_app_name());
-    s
-}
-
 fn write_plist_atomically(path: &str, body: &str) -> ResultType<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -335,28 +329,20 @@ fn write_plist_atomically(path: &str, body: &str) -> ResultType<()> {
 }
 
 pub fn write_plists() -> ResultType<()> {
-    let daemon_plist_path = format!(
-        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
-        crate::get_app_name()
-    );
-    let agent_plist_path = format!(
-        "/Library/LaunchAgents/com.carriez.{}_server.plist",
-        crate::get_app_name()
-    );
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         bail!("daemon.plist not found in embedded resources");
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(str::to_owned) else {
         bail!("Failed to read daemon.plist");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         bail!("agent.plist not found in embedded resources");
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(str::to_owned) else {
         bail!("Failed to read agent.plist");
     };
-    write_plist_atomically(&daemon_plist_path, &daemon_plist_body)?;
-    write_plist_atomically(&agent_plist_path, &agent_plist_body)?;
+    write_plist_atomically(MACOS_DAEMON_PLIST, &daemon_plist_body)?;
+    write_plist_atomically(MACOS_AGENT_PLIST, &agent_plist_body)?;
     log::info!("[write-plists] Wrote daemon and agent plists");
     Ok(())
 }
@@ -370,7 +356,7 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     let Some(script_file) = PRIVILEGES_SCRIPTS_DIR.get_file("uninstall.scpt") else {
         return false;
     };
-    let Some(script_body) = script_file.contents_utf8().map(correct_app_name) else {
+    let Some(script_body) = script_file.contents_utf8().map(str::to_owned) else {
         return false;
     };
 
@@ -384,8 +370,7 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
                 log::error!("run osascript failed: {}", e);
             }
             _ => {
-                let agent = format!("{}_server.plist", crate::get_full_name());
-                let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
+                let agent_plist_file = MACOS_AGENT_PLIST;
                 let uninstalled = !std::path::Path::new(&agent_plist_file).exists();
                 log::info!(
                     "Agent file {} uninstalled: {}",
@@ -400,7 +385,7 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
                     }
                     crate::ipc::set_option("stop-service", "Y");
                     std::process::Command::new("launchctl")
-                        .args(&["remove", &format!("{}_server", crate::get_full_name())])
+                        .args(["remove", MACOS_AGENT_LABEL])
                         .status()
                         .ok();
                     if show_new_window {
@@ -955,9 +940,7 @@ pub fn update_me() -> ResultType<()> {
 
     let app_name = crate::get_app_name();
     if is_installed_daemon && !is_service_stopped {
-        let agent = format!("{}_server.plist", crate::get_full_name());
-        let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
-        update_daemon_agent(agent_plist_file, app_dir, true);
+        update_daemon_agent(MACOS_AGENT_PLIST.to_owned(), app_dir, true);
     } else {
         // `kill -9` may not work without "administrator privileges"
         let update_body = r#"
@@ -1103,8 +1086,8 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
-    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+    let agent_plist = MACOS_AGENT_PLIST.to_owned();
+    let daemon_plist = MACOS_DAEMON_PLIST.to_owned();
 
     log::info!("[root-update] Starting silent root update from {}", dmg_path);
     // Check sessions before extracting to avoid unnecessary work
@@ -1202,7 +1185,7 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     // Ensure the staged release contains the service executable before we
     // proceed. Plist generation itself is done in this already-root process;
     // launching a freshly extracted service binary from /tmp is not required.
-    let new_service = format!("{}/Contents/MacOS/service", src_app);
+    let new_service = format!("{}/Contents/MacOS/{}", src_app, MACOS_SERVICE_EXECUTABLE);
     if !std::path::Path::new(&new_service).is_file() {
         bail!("[root-update] staged service binary is missing: {}", new_service);
     }
@@ -1235,8 +1218,8 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     // Write a shell script that runs detached after this function returns.
     // We cannot directly replace /Applications/Telemost.app while it is running,
     // so we spawn a script that waits, kills processes, copies, and restarts.
-    let daemon_label = format!("com.carriez.{}_service", app_name);
-    let agent_label = format!("com.carriez.{}_server", app_name);
+    let daemon_label = MACOS_DAEMON_LABEL;
+    let agent_label = MACOS_AGENT_LABEL;
     let script_path = format!("{}/telemost_update.sh", tmp_dir);
     let script = format!(
         r#"#!/bin/sh
@@ -1516,7 +1499,7 @@ stop_daemon() {{
     return 1
 }}
 write_new_plists() {{
-    /Applications/{app_name}.app/Contents/MacOS/service --write-plists \
+    /Applications/{app_name}.app/Contents/MacOS/{service_executable} --write-plists \
         >"{tmp_dir}/write-plists.log" 2>&1 &
     write_pid=$!
     for _ in $(/usr/bin/seq 1 60); do
@@ -1630,7 +1613,7 @@ fi
 # Validate staged bundle before atomic swap
 if [ ! -d "$staged_bundle/Contents/MacOS" ] || \
    [ ! -f "$staged_bundle/Contents/MacOS/{app_name}" ] || \
-   [ ! -f "$staged_bundle/Contents/MacOS/service" ] || \
+   [ ! -f "$staged_bundle/Contents/MacOS/{service_executable}" ] || \
    [ ! -f "$staged_bundle/Contents/Info.plist" ]; then
     echo "[root-update] staged bundle validation failed, aborting" >> {tmp_dir}/telemost_root_update.log
     rm -rf "$staged_bundle"
@@ -1661,8 +1644,8 @@ if ! chown root:wheel {app_bundle} || \
    ! chmod 755 {app_bundle}/Contents || \
    ! chown root:wheel {app_bundle}/Contents/MacOS || \
    ! chmod 755 {app_bundle}/Contents/MacOS || \
-   ! chown root:wheel {app_bundle}/Contents/MacOS/service || \
-   ! chmod 755 {app_bundle}/Contents/MacOS/service || \
+   ! chown root:wheel {app_bundle}/Contents/MacOS/{service_executable} || \
+   ! chmod 755 {app_bundle}/Contents/MacOS/{service_executable} || \
    ! chown root:wheel {app_bundle}/Contents/MacOS/{app_name} || \
    ! chmod 755 {app_bundle}/Contents/MacOS/{app_name}; then
     echo "[root-update] hardening failed, restoring backup" >> {tmp_dir}/telemost_root_update.log
@@ -1721,6 +1704,7 @@ rm -rf {tmp_dir}
         tmp_dir = tmp_dir,
         daemon_label = daemon_label,
         agent_label = agent_label,
+        service_executable = MACOS_SERVICE_EXECUTABLE,
         daemon_plist_bak = daemon_plist_bak,
         agent_plist_bak = agent_plist_bak,
     );
@@ -2093,26 +2077,62 @@ impl WakeLock {
     }
 }
 
-fn get_bundle_id() -> Option<String> {
-    unsafe {
-        let bundle: id = msg_send![class!(NSBundle), mainBundle];
-        if bundle.is_null() {
-            return None;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let bundle_id: id = msg_send![bundle, bundleIdentifier];
-        if bundle_id.is_null() {
-            return None;
-        }
+    #[test]
+    fn launchd_templates_use_telemost_identity() {
+        let daemon = PRIVILEGES_SCRIPTS_DIR
+            .get_file("daemon.plist")
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded daemon plist");
+        let agent = PRIVILEGES_SCRIPTS_DIR
+            .get_file("agent.plist")
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded agent plist");
+        let install = PRIVILEGES_SCRIPTS_DIR
+            .get_file("install.scpt")
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded install script");
+        let update = PRIVILEGES_SCRIPTS_DIR
+            .get_file("update.scpt")
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded update script");
+        let uninstall = PRIVILEGES_SCRIPTS_DIR
+            .get_file("uninstall.scpt")
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded uninstall script");
 
-        let c_str: *const std::os::raw::c_char = msg_send![bundle_id, UTF8String];
-        if c_str.is_null() {
-            return None;
-        }
+        assert!(daemon.contains(MACOS_DAEMON_LABEL));
+        assert!(daemon.contains("com.telemost.desktop"));
+        assert!(daemon.contains("/Applications/Telemost.app/Contents/MacOS/TelemostService"));
+        assert!(agent.contains(MACOS_AGENT_LABEL));
+        assert!(agent.contains("com.telemost.desktop"));
+        assert!(agent.contains("/Applications/Telemost.app/Contents/MacOS/Telemost"));
+        assert!(install.contains(MACOS_DAEMON_PLIST));
+        assert!(install.contains(MACOS_AGENT_PLIST));
+        assert!(install.contains("Library/Preferences/com.telemost.Telemost"));
+        assert!(update.contains(MACOS_DAEMON_PLIST));
+        assert!(update.contains(MACOS_AGENT_PLIST));
+        assert!(uninstall.contains(MACOS_DAEMON_PLIST));
+        assert!(uninstall.contains(MACOS_AGENT_PLIST));
+        assert!(!daemon.contains("com.carriez"));
+        assert!(!agent.contains("com.carriez"));
+        assert!(!install.contains("com.carriez"));
+        assert!(!update.contains("com.carriez"));
+        assert!(!uninstall.contains("com.carriez"));
+    }
 
-        let bundle_id_str = std::ffi::CStr::from_ptr(c_str)
-            .to_string_lossy()
-            .to_string();
-        Some(bundle_id_str)
+    #[test]
+    fn launchd_plist_paths_match_labels() {
+        assert_eq!(
+            MACOS_DAEMON_PLIST,
+            format!("/Library/LaunchDaemons/{MACOS_DAEMON_LABEL}.plist")
+        );
+        assert_eq!(
+            MACOS_AGENT_PLIST,
+            format!("/Library/LaunchAgents/{MACOS_AGENT_LABEL}.plist")
+        );
     }
 }

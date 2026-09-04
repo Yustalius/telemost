@@ -899,6 +899,8 @@ def build_flutter_dmg(version, features):
     # copy dylib
     system2(
         "cp target/release/liblibtelemost.dylib target/release/libtelemost.dylib")
+    system2(
+        "install_name_tool -id @rpath/libtelemost.dylib target/release/libtelemost.dylib")
     os.chdir('flutter')
     # cargo builds a single-arch dylib for the host; restrict Xcode to the same arch
     # so the universal-by-default ARCHS_STANDARD doesn't try to link a missing slice.
@@ -906,7 +908,7 @@ def build_flutter_dmg(version, features):
     mac_arch = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
     system2(
         f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release')
-    system2('cp -rf ../target/release/service ./build/macos/Build/Products/Release/Telemost.app/Contents/MacOS/')
+    system2('cp -f ../target/release/service ./build/macos/Build/Products/Release/Telemost.app/Contents/MacOS/TelemostService')
     '''
     system2(
         "create-dmg --volname \"Telemost Installer\" --window-pos 200 120 --window-size 800 400 --icon-size 100 --app-drop-link 600 185 --icon Telemost.app 200 190 --hide-extension Telemost.app telemost.dmg ./build/macos/Build/Products/Release/Telemost.app")

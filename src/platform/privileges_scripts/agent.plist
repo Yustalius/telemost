@@ -3,10 +3,10 @@
 <plist version="1.0">
     <dict>
         <key>Label</key>
-        <string>com.carriez.Telemost_server</string>
+        <string>com.telemost.desktop.agent</string>
 
 	<key>AssociatedBundleIdentifiers</key>
-	<string>com.carriez.telemost</string>
+	<string>com.telemost.desktop</string>
     
         <key>LimitLoadToSessionType</key>
         <array>

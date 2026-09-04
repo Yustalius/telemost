@@ -3,10 +3,10 @@
 <plist version="1.0">
     <dict>
         <key>Label</key>
-        <string>com.carriez.Telemost_service</string>
+        <string>com.telemost.desktop.service</string>
 
 	<key>AssociatedBundleIdentifiers</key>
-	<string>com.carriez.telemost</string>
+	<string>com.telemost.desktop</string>
     
         <key>KeepAlive</key>
         <true/>
@@ -16,7 +16,7 @@
         <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>/Applications/Telemost.app/Contents/MacOS/service</string>
+        <string>/Applications/Telemost.app/Contents/MacOS/TelemostService</string>
         </array>
         <key>RunAtLoad</key>
         <true/>

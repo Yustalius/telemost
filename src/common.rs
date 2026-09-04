@@ -1984,7 +1984,7 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
         if same_uid && p.user_id() != my_uid {
             continue;
         }
-        // on mac, p.cmd() get "/Applications/Telemost.app/Contents/MacOS/Telemost", "XPC_SERVICE_NAME=com.carriez.Telemost_server"
+        // on mac, p.cmd() get "/Applications/Telemost.app/Contents/MacOS/Telemost", "XPC_SERVICE_NAME=com.telemost.desktop.agent"
         let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
         if arg.is_empty() {
             if !parg.starts_with("--") {

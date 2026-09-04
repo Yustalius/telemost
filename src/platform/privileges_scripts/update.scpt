@@ -1,7 +1,7 @@
 on run {daemon_file, agent_file, user, cur_pid, source_dir}
 
-  set agent_plist to "/Library/LaunchAgents/com.carriez.Telemost_server.plist"
-  set daemon_plist to "/Library/LaunchDaemons/com.carriez.Telemost_service.plist"
+  set agent_plist to "/Library/LaunchAgents/com.telemost.desktop.agent.plist"
+  set daemon_plist to "/Library/LaunchDaemons/com.telemost.desktop.service.plist"
   set app_bundle to "/Applications/Telemost.app"
 
   set check_source to "test -d " & quoted form of source_dir & " || exit 1;"
