@@ -716,7 +716,7 @@ jobs:
           submodules: recursive
 
       - name: Import the codesign cert
-        if: env.MACOS_P12_BASE64 != null
+        if: env.MACOS_P12_BASE64 != ''
         uses: apple-actions/import-codesign-certs@253ddeeac23f2bdad1646faac5c8c2832e800071 # v1
         with:
           p12-file-base64: ${{ secrets.MACOS_P12_BASE64 }}
@@ -724,33 +724,14 @@ jobs:
           keychain: telemost
 
       - name: Check sign and import sign key
-        if: env.MACOS_P12_BASE64 != null
+        if: env.MACOS_P12_BASE64 != ''
         run: |
           security default-keychain -s telemost.keychain
           security find-identity -v
 
-      - name: Import notarize key
-        if: env.MACOS_P12_BASE64 != null
-        uses: timheuer/base64-to-file@adaa40c0c581f276132199d4cf60afa07ce60eac # v1.2
-        with:
-          # https://gregoryszorc.com/docs/apple-codesign/stable/apple_codesign_rcodesign.html#notarizing-and-stapling
-          fileName: telemost.json
-          fileDir: ${{ github.workspace }}
-          encodedString: ${{ secrets.MACOS_NOTARIZE_JSON }}
-
-      - name: Install rcodesign tool
-        if: env.MACOS_P12_BASE64 != null
-        shell: bash
-        run: |
-          pushd /tmp
-          wget https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.22.0/apple-codesign-0.22.0-macos-universal.tar.gz
-          tar -zxvf apple-codesign-0.22.0-macos-universal.tar.gz
-          mv apple-codesign-0.22.0-macos-universal/rcodesign /usr/local/bin
-          popd
-
       - name: Install build runtime
         run: |
-          brew install llvm create-dmg
+          brew install llvm
           # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
           if command -v pkg-config &>/dev/null; then
               echo "pkg-config is already installed"
@@ -842,6 +823,9 @@ jobs:
       - name: Self-test macOS release audit
         run: ./tools/test-macos-audit-release.sh
 
+      - name: Self-test macOS release signing
+        run: ./tools/test-macos-sign-release.sh
+
       - name: Build telemost
         run: |
           export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${GITHUB_WORKSPACE}=."
@@ -869,75 +853,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: create unsigned dmg
-        if: env.UPLOAD_ARTIFACT == 'true'
+      - name: Create macOS release DMG
+        if: env.MACOS_P12_BASE64 != '' && env.UPLOAD_ARTIFACT == 'true'
         run: |
-          CREATE_DMG="$(command -v create-dmg)"
-          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
-          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
-          create-dmg --icon "Telemost.app" 200 190 --hide-extension "Telemost.app" --window-size 800 400 --app-drop-link 600 185 telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg ./flutter/build/macos/Build/Products/Release/Telemost.app
-
-      - name: Upload unsigned macOS app
-        if: env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: telemost-unsigned-macos-${{ matrix.job.arch }}
-          path: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg # can not upload the directory directly or tar.gz, which destroy the link structure, causing the codesign failed
-
-      - name: Codesign app and create signed dmg
-        if: env.MACOS_P12_BASE64 != null && env.UPLOAD_ARTIFACT == 'true'
-        run: |
-          # Patch create-dmg to give more attempts to unmount image
-          CREATE_DMG="$(command -v create-dmg)"
-          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
-          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
-          # Unlock keychain
-          security default-keychain -s telemost.keychain
-          security unlock-keychain -p ${{ secrets.MACOS_P12_PASSWORD }} telemost.keychain
-          # start sign the telemost.app and dmg
-          rm -rf *.dmg || true
-          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict ./flutter/build/macos/Build/Products/Release/Telemost.app -vvv
-          create-dmg --icon "Telemost.app" 200 190 --hide-extension "Telemost.app" --window-size 800 400 --app-drop-link 600 185 telemost-${{ env.VERSION }}.dmg ./flutter/build/macos/Build/Products/Release/Telemost.app
-          codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict telemost-${{ env.VERSION }}.dmg -vvv
-          # notarize the telemost-${{ env.VERSION }}.dmg
-          rcodesign notary-submit --api-key-path ${{ github.workspace }}/telemost.json  --staple telemost-${{ env.VERSION }}.dmg
-
-      - name: Rename telemost
-        if: env.UPLOAD_ARTIFACT == 'true'
-        run: |
-          for name in telemost*??.dmg; do
-              mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
-          done
+          security unlock-keychain -p "${{ secrets.MACOS_P12_PASSWORD }}" telemost.keychain
+          ./tools/macos-sign-release.sh \
+            ./flutter/build/macos/Build/Products/Release/Telemost.app \
+            ./release
+          test -f "./release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg"
+          test -f "./release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg.sha256"
 
       - name: Publish DMG package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.MACOS_P12_BASE64 != '' && env.UPLOAD_ARTIFACT == 'true'
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
-            telemost*-${{ matrix.job.arch }}.dmg
+            release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg
+            release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg.sha256
 
   publish_unsigned:
     needs:
-      - build-for-macOS
       - build-for-windows-flutter
       - build-for-windows-sciter
     runs-on: ubuntu-latest
     if: ${{ inputs.upload-artifact }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: telemost-unsigned-macos-x86_64
-          path: ./
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: telemost-unsigned-macos-aarch64
-          path: ./
-
       - name: Download Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -952,7 +894,7 @@ jobs:
 
       - name: Combine unsigned app
         run: |
-          tar czf telemost-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-x86
+          tar czf telemost-${{ env.VERSION }}-unsigned.tar.gz windows-x86_64 windows-x86
 
       - name: Publish unsigned app
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
