@@ -843,6 +843,9 @@ jobs:
       - name: Self-test macOS release signing
         run: ./tools/test-macos-sign-release.sh
 
+      - name: Self-test macOS Flutter package mapping
+        run: python3 tools/test-macos-flutter-build.py
+
       - name: Build telemost
         run: |
           export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${GITHUB_WORKSPACE}=."

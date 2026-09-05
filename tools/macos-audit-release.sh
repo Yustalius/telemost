@@ -11,32 +11,44 @@ app_path=${1%/}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 plist="$app_path/Contents/Info.plist"
+failures=()
 
 fail() {
-    echo "macOS release audit failed: $*" >&2
-    exit 1
+    failures+=("$*")
 }
 
-[[ -d "$app_path" ]] || fail "bundle does not exist: $app_path"
+finish_audit() {
+    if [[ ${#failures[@]} -gt 0 ]]; then
+        echo "macOS release audit failed:" >&2
+        printf '  %s\n' "${failures[@]}" | LC_ALL=C sort -u >&2
+        exit 1
+    fi
+}
+
+if [[ ! -d "$app_path" ]]; then
+    fail "bundle does not exist: $app_path"
+    finish_audit
+fi
 [[ -f "$plist" ]] || fail "missing Contents/Info.plist"
 [[ -x "$app_path/Contents/MacOS/Telemost" ]] || fail "missing executable Contents/MacOS/Telemost"
 [[ -x "$app_path/Contents/MacOS/TelemostService" ]] || fail "missing executable Contents/MacOS/TelemostService"
 [[ -f "$app_path/Contents/Frameworks/libtelemost.dylib" ]] || fail "missing Contents/Frameworks/libtelemost.dylib"
 [[ ! -e "$app_path/Contents/MacOS/service" ]] || fail "legacy Contents/MacOS/service is present"
 
-if find "$app_path" -name 'liblibtelemost.dylib' -print -quit | grep -q .; then
-    fail "legacy liblibtelemost.dylib is present"
-fi
+while IFS= read -r -d '' legacy_library; do
+    fail "legacy liblibtelemost.dylib is present: ${legacy_library#"$app_path/"}"
+done < <(find "$app_path" -name 'liblibtelemost.dylib' -print0)
 
-symbol_artifact=$(find "$app_path" \( \
+while IFS= read -r -d '' symbol_artifact; do
+    fail "debug symbol artifact is bundled: ${symbol_artifact#"$app_path/"}"
+done < <(find "$app_path" \( \
     -iname '*.dSYM' -o \
     -iname '*.symbols' -o \
     -iname '*.symbolmap' -o \
     -iname '*.bcsymbolmap' -o \
     -iname '*split*debug*info*' -o \
     -iname '*flutter*symbol*' \
-\) -print -quit)
-[[ -z "$symbol_artifact" ]] || fail "debug symbol artifact is bundled: ${symbol_artifact#"$app_path/"}"
+\) -print0)
 
 version_value=$(awk '$1 == "version:" { print $2; exit }' "$repo_root/flutter/pubspec.yaml")
 [[ "$version_value" == *+* ]] || fail "cannot read version and build number from flutter/pubspec.yaml"
@@ -96,6 +108,7 @@ scan_rustdesk_marker() {
         cleaned=${line//RUSTDESK_HWCODEC_NVENC_GPU/}
         if printf '%s\n' "$cleaned" | LC_ALL=C grep -F -i -q -- "rustdesk"; then
             fail "forbidden marker 'rustdesk' in ${source_path#"$app_path/"}"
+            return
         fi
     done < <(LC_ALL=C grep -a -F -i -- "rustdesk" "$payload" || true)
 }
@@ -134,11 +147,15 @@ done < <(find "$app_path" -mindepth 1 -print0)
 
 while IFS= read -r -d '' candidate; do
     if file -b "$candidate" | grep -q 'Mach-O'; then
-        strings -a "$candidate" >"$strings_output"
+        if ! strings -a "$candidate" >"$strings_output"; then
+            fail "cannot extract Mach-O strings: ${candidate#"$app_path/"}"
+            continue
+        fi
         scan_payload "$strings_output" "$candidate"
     else
         scan_payload "$candidate" "$candidate"
     fi
 done < <(find "$app_path" -type f -print0)
 
+finish_audit
 echo "macOS release audit passed: $app_path"

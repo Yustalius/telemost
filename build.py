@@ -64,6 +64,32 @@ def rustflags_with_workspace_remap():
     return f'{existing} {remap}'.strip()
 
 
+def prepare_macos_flutter_package_config():
+    import json
+
+    config_path = Path('.dart_tool/package_config.json')
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    if config.get('configVersion') != 2:
+        raise ValueError('macOS release requires Dart package_config version 2')
+    # Flutter embeds the registrant URI for runtime lookup even with obfuscation.
+    # Map its generated directory to a package URI before kernel/AOT compilation.
+    generated_package = {
+        'name': 'telemost_build',
+        'rootUri': 'flutter_build/',
+        'packageUri': './',
+    }
+    for package in config['packages']:
+        if package['name'] == generated_package['name']:
+            if package != generated_package:
+                raise ValueError('Dart package name telemost_build is already in use')
+            return
+    config['packages'].append(generated_package)
+    config_path.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+    # Flutter hashes package_config_subset, not the edited JSON, for kernel caching.
+    for stamp in config_path.parent.glob('flutter_build/*/kernel_snapshot.stamp'):
+        stamp.unlink()
+
+
 def get_version():
     with open("Cargo.toml", encoding="utf-8") as fh:
         for line in fh:
@@ -914,6 +940,8 @@ def build_flutter_dmg(version, features):
     system2(
         "install_name_tool -id @rpath/libtelemost.dylib target/release/libtelemost.dylib")
     os.chdir('flutter')
+    system2('flutter pub get')
+    prepare_macos_flutter_package_config()
     # cargo builds a single-arch dylib for the host; restrict Xcode to the same arch
     # so the universal-by-default ARCHS_STANDARD doesn't try to link a missing slice.
     # FLUTTER_XCODE_* env vars are forwarded to xcodebuild as build settings.
@@ -922,7 +950,7 @@ def build_flutter_dmg(version, features):
     split_debug_info = f'../target/flutter-symbols/macos-{symbol_arch}'
     system2(
         f'FLUTTER_XCODE_ARCHS={mac_arch} FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES '
-        f'flutter build macos --release --obfuscate --split-debug-info={split_debug_info}')
+        f'flutter build macos --no-pub --release --obfuscate --split-debug-info={split_debug_info}')
     system2('cp -f ../target/release/service ./build/macos/Build/Products/Release/Telemost.app/Contents/MacOS/TelemostService')
     licenses_dir = './build/macos/Build/Products/Release/Telemost.app/Contents/Resources/licenses'
     os.makedirs(licenses_dir, exist_ok=True)

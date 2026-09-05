@@ -174,4 +174,43 @@ EOF
 /usr/bin/clang "$fixture_root/marker.c" -o "$case_app/Contents/MacOS/Telemost"
 expect_fail macho-strings "$case_app"
 
+case_app=$(new_case all-violations)
+/usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 0' "$case_app/Contents/Info.plist"
+printf '%s\n' "${blocked_markers[@]}" "${blocked_markers[@]}" \
+    >"$case_app/Contents/Resources/rustdesk.txt"
+mkdir "$case_app/Contents/Resources/First.dSYM" "$case_app/Contents/Resources/Second.dSYM"
+cat >"$fixture_root/multiple-markers.c" <<'EOF'
+__attribute__((used)) static const char markers[] = "/api/audit\0/api/heartbeat";
+int main(void) { return markers[0] == '\0'; }
+EOF
+/usr/bin/clang "$fixture_root/multiple-markers.c" -o "$case_app/Contents/MacOS/Telemost"
+expect_fail all-violations "$case_app"
+
+expect_reported_once() {
+    local expected="  $1"
+    if [[ $(grep -F -x -c -- "$expected" "$fixture_root/all-violations.log" || true) != 1 ]]; then
+        echo "self-test failed: expected exactly one diagnostic: $1" >&2
+        exit 1
+    fi
+    pass_count=$((pass_count + 1))
+}
+
+for marker in "${blocked_markers[@]}"; do
+    case "$marker" in
+        "RustDesk"|"rs-ny.rustdesk.com") marker=rustdesk ;;
+    esac
+    expect_reported_once "forbidden marker '$marker' in Contents/Resources/rustdesk.txt"
+done
+expect_reported_once "forbidden marker '/api/audit' in Contents/MacOS/Telemost"
+expect_reported_once "forbidden marker '/api/heartbeat' in Contents/MacOS/Telemost"
+expect_reported_once "unexpected CFBundleVersion"
+expect_reported_once "debug symbol artifact is bundled: Contents/Resources/First.dSYM"
+expect_reported_once "debug symbol artifact is bundled: Contents/Resources/Second.dSYM"
+if grep -F -q -e 'Contents/Resources/licenses/NOTICE.txt' \
+    -e 'Contents/Resources/compatibility.txt' "$fixture_root/all-violations.log"; then
+    echo 'self-test failed: an allowed license or NVENC marker was reported' >&2
+    exit 1
+fi
+pass_count=$((pass_count + 1))
+
 echo "macOS release audit self-test passed ($pass_count checks)"
