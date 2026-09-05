@@ -861,6 +861,31 @@ jobs:
       - name: Audit macOS release bundle
         run: ./tools/macos-audit-release.sh ./flutter/build/macos/Build/Products/Release/Telemost.app
 
+      - name: Package macOS app
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          mkdir -p ./release
+          ditto -c -k --sequesterRsrc --keepParent \
+            ./flutter/build/macos/Build/Products/Release/Telemost.app \
+            ./release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.zip
+
+      - name: Upload macOS app
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemost-${{ env.VERSION }}-${{ matrix.job.arch }}
+          path: release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish macOS app archive
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: release/telemost-${{ env.VERSION }}-${{ matrix.job.arch }}.zip
+
       - name: Upload macOS debug symbols
         if: always() && env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
