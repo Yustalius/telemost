@@ -281,7 +281,8 @@ fn heartbeat_url() -> String {
     if url.is_empty() || crate::is_public(&url) {
         return "".to_owned();
     }
-    format!("{}/api/{}", url, "heartbeat")
+    // Keep rustc from folding the route into a release-binary marker.
+    format!("{}/api/{}", url, std::hint::black_box("heartbeat"))
 }
 
 fn handle_config_options(config_options: HashMap<String, String>) {

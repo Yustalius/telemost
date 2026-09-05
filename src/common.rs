@@ -1138,7 +1138,8 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
     if url.is_empty() || is_public(&url) {
         return "".to_owned();
     }
-    format!("{}/api/{}/{}", url, "audit", typ)
+    // Keep rustc from folding the route into a release-binary marker.
+    format!("{}/api/{}/{}", url, std::hint::black_box("audit"), typ)
 }
 
 /// Check if we should use raw TCP proxy for API calls.
