@@ -1058,9 +1058,9 @@ async fn handle_down_batch(session: Arc<Session>, opts: &ServerOpts) -> Response
         None => return octet_resp(encode_close()),
     };
     let mut out = BytesMut::new();
-    // Long-poll: block up to poll_wait for the first byte so an idle client is
+    // Long-poll: block up to a jittered poll_wait for the first byte so an idle client is
     // not hammering the proxy, then drain whatever else is immediately ready.
-    match tokio::time::timeout(opts.poll_wait, rx.next()).await {
+    match tokio::time::timeout(jittered_poll_wait(opts.poll_wait), rx.next()).await {
         Ok(Some(b)) => out.extend_from_slice(&encode_data(&b)),
         Ok(None) => {
             session.closed.store(true, Relaxed);
@@ -1077,6 +1077,16 @@ async fn handle_down_batch(session: Arc<Session>, opts: &ServerOpts) -> Response
         }
     }
     octet_resp(out.freeze())
+}
+
+fn jittered_poll_wait_with_percent(poll_wait: Duration, percent: u16) -> Duration {
+    poll_wait.mul_f64(f64::from(percent) / 1000.0)
+}
+
+fn jittered_poll_wait(poll_wait: Duration) -> Duration {
+    use rand::Rng;
+
+    jittered_poll_wait_with_percent(poll_wait, rand::thread_rng().gen_range(800..=1000))
 }
 
 async fn handle_close(req: Request<Incoming>, reg: &Registry) -> Response<BoxBody> {
@@ -2216,6 +2226,48 @@ mod tests {
         dec.push(&[0, 0, 0, 0]); // what encode_data(b"") would produce
         assert_eq!(dec.next_frame(), Some(TunFrame::KeepAlive));
         assert_eq!(dec.next_frame(), None);
+    }
+
+    #[test]
+    fn batch_poll_jitter_stays_within_configured_bounds() {
+        let poll_wait = Duration::from_secs(5);
+        assert_eq!(
+            jittered_poll_wait_with_percent(poll_wait, 800),
+            Duration::from_secs(4)
+        );
+        assert_eq!(jittered_poll_wait_with_percent(poll_wait, 1000), poll_wait);
+        for _ in 0..64 {
+            let wait = jittered_poll_wait(poll_wait);
+            assert!((Duration::from_secs(4)..=poll_wait).contains(&wait));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_poll_returns_queued_data_without_waiting_for_timeout() {
+        let (to_target, _) = tokio::sync::mpsc::channel(1);
+        let (mut down_tx, down_rx) = fmpsc::channel(1);
+        down_tx.send(Bytes::from_static(b"ready")).await.unwrap();
+        let session = Arc::new(Session {
+            to_target,
+            down: tokio::sync::Mutex::new(Some(down_rx)),
+            closed: Arc::new(AtomicBool::new(false)),
+            last: std::sync::Mutex::new(Instant::now()),
+            target: String::new(),
+        });
+        let opts = ServerOpts {
+            echo_all: false,
+            keepalive: Duration::from_secs(15),
+            timeout: Duration::from_secs(30),
+            poll_wait: Duration::from_secs(5),
+            auth_token: None,
+            max_sessions: 1,
+            allow_legacy: false,
+            routes: Arc::new(HashMap::new()),
+        };
+
+        let response = handle_down_batch(session, &opts).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, encode_data(b"ready"));
     }
 
     #[cfg(windows)]
