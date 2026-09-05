@@ -956,6 +956,7 @@ def build_flutter_dmg(version, features):
     os.makedirs(licenses_dir, exist_ok=True)
     shutil.copy2(os.path.join(REPO_ROOT, 'LICENCE'),
                  os.path.join(licenses_dir, 'AGPL-3.0.txt'))
+    system2('../tools/macos-sign-adhoc.sh ./build/macos/Build/Products/Release/Telemost.app')
     '''
     system2(
         "create-dmg --volname \"Telemost Installer\" --window-pos 200 120 --window-size 800 400 --icon-size 100 --app-drop-link 600 185 --icon Telemost.app 200 190 --hide-extension Telemost.app telemost.dmg ./build/macos/Build/Products/Release/Telemost.app")

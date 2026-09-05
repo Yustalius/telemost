@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
 import shlex
 import subprocess
 import sys
@@ -117,8 +118,20 @@ class MacOSFlutterBuildTest(unittest.TestCase):
                             'FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES',
                             '--split-debug-info=../target/flutter-symbols/macos-' + symbol_arch):
                     self.assertIn(arg, args)
+                service_command = next(c for c in commands if 'TelemostService' in c)
+                signing_command = next(c for c in commands if 'macos-sign-adhoc.sh' in c)
                 self.assertLess(commands.index('flutter pub get'), commands.index(build_command))
+                self.assertLess(commands.index(build_command), commands.index(service_command))
+                self.assertLess(commands.index(service_command), commands.index(signing_command))
                 self.assertEqual(Path.cwd(), self.root)
+
+    def test_adhoc_entitlements_allow_flutter_framework_loading(self):
+        path = repo_root / 'flutter/macos/Runner/AdHocRelease.entitlements'
+        with path.open('rb') as stream:
+            entitlements = plistlib.load(stream)
+        self.assertIs(entitlements['com.apple.security.cs.disable-library-validation'], True)
+        self.assertIs(entitlements['com.apple.security.cs.allow-jit'], True)
+        self.assertIs(entitlements['com.apple.security.app-sandbox'], False)
 
     @unittest.skipUnless(os.environ.get('TELEMOST_TEST_DART_SDK'), 'Dart SDK not selected for AOT smoke test')
     def test_aot_registrant_uri_and_runtime_routes(self):
