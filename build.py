@@ -905,7 +905,8 @@ def build_flutter_dmg(version, features):
         # set minimum osx build target, now is 10.14, which is the same as the flutter xcode project
         rustflags = shlex.quote(rustflags_with_workspace_remap())
         system2(
-            f'RUSTFLAGS={rustflags} MACOSX_DEPLOYMENT_TARGET=10.14 '
+            f'CARGO_PROFILE_RELEASE_RPATH=false RUSTFLAGS={rustflags} '
+            f'MACOSX_DEPLOYMENT_TARGET=10.14 '
             f'cargo build --locked --features {features} --release')
     # copy dylib
     system2(

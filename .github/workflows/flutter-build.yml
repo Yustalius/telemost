@@ -3,6 +3,10 @@ name: Build the flutter version of the Telemost
 on:
   workflow_call:
     inputs:
+      desktop_only:
+        description: Build only Windows and macOS targets
+        type: boolean
+        default: true
       upload-artifact:
         type: boolean
         default: true
@@ -11,6 +15,10 @@ on:
         default: "nightly"
   workflow_dispatch:
     inputs:
+      desktop_only:
+        description: Build only Windows and macOS targets
+        type: boolean
+        default: true
       upload-artifact:
         type: boolean
         default: false
@@ -62,6 +70,7 @@ env:
 
 jobs:
   generate-sbom:
+    if: ${{ inputs.desktop_only == false }}
     runs-on: ubuntu-latest
 
     permissions:
@@ -566,7 +575,7 @@ jobs:
             ./SignOutput/telemost-*.exe
 
   build-telemost-ios:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.desktop_only == false && inputs.upload-artifact }}
     name: build telemost ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -912,6 +921,7 @@ jobs:
           files: telemost-${{ env.VERSION }}-unsigned.tar.gz
 
   build-telemost-android:
+    if: ${{ inputs.desktop_only == false }}
     needs: [generate-bridge]
     name: build telemost android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
@@ -1207,7 +1217,7 @@ jobs:
   build-telemost-android-universal:
     needs: [build-telemost-android]
     name: build telemost android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.desktop_only == false && inputs.upload-artifact }}
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1390,6 +1400,7 @@ jobs:
             signed-apk/telemost-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-telemost-linux:
+    if: ${{ inputs.desktop_only == false }}
     needs: [generate-bridge]
     name: build telemost linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -1731,6 +1742,7 @@ jobs:
   # old for it. A separate job rather than a matrix entry of build-telemost-linux: appimage and
   # flatpak need that job, and a failure here must not skip them.
   build-telemost-linux-drm:
+    if: ${{ inputs.desktop_only == false }}
     needs: [generate-bridge]
     name: build telemost linux drm x86_64
     runs-on: ubuntu-22.04
@@ -1995,7 +2007,7 @@ jobs:
           path: ${{ env.DRM_DEB }}
 
   build-telemost-linux-sciter:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.desktop_only == false && inputs.upload-artifact }}
     runs-on: ${{ matrix.job.on }}
     name: build-telemost-linux-sciter ${{ matrix.job.target }}
     strategy:
@@ -2224,7 +2236,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-telemost-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.desktop_only == false && inputs.upload-artifact }}
     strategy:
       fail-fast: false
       matrix:
@@ -2277,7 +2289,7 @@ jobs:
       - build-telemost-linux
       - build-telemost-linux-sciter
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.desktop_only == false && inputs.upload-artifact }}
     strategy:
       fail-fast: false
       matrix:
