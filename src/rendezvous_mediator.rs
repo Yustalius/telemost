@@ -114,7 +114,7 @@ pub struct RendezvousMediator {
 ))]
 #[inline]
 fn http_tunnel_ready() -> bool {
-    crate::http_tunnel::is_ready()
+    !config::is_http_tunnel_enabled() || crate::http_tunnel::is_ready()
 }
 
 #[cfg(not(all(

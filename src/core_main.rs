@@ -32,6 +32,7 @@ pub fn core_main() -> Option<Vec<String>> {
     if !crate::common::global_init() {
         return None;
     }
+    config::set_http_tunnel_enabled(crate::common::is_http_tunnel_requested());
     crate::load_custom_client();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {

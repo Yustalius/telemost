@@ -635,7 +635,7 @@ pub async fn start_server(is_server: bool, no_server: bool) {
             feature = "http-tunnel",
             any(target_os = "macos", target_os = "linux", target_os = "windows")
         ))]
-        if !crate::http_tunnel::start().await {
+        if hbb_common::config::is_http_tunnel_enabled() && !crate::http_tunnel::start().await {
             log::error!("HTTP batch tunnel is not ready; the rendezvous mediator will not register until it is");
         }
         crate::RendezvousMediator::start_all().await;

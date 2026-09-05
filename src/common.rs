@@ -54,6 +54,18 @@ pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Out
 
 // the executable name of the portable version
 pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "TELEMOST_APPNAME";
+pub const HTTP_TUNNEL_ARG: &str = "--tunnel";
+
+#[inline]
+fn is_http_tunnel_arg(arg: &std::ffi::OsStr) -> bool {
+    arg == std::ffi::OsStr::new(HTTP_TUNNEL_ARG)
+}
+
+fn without_http_tunnel_arg<T: AsRef<std::ffi::OsStr>>(
+    args: impl Iterator<Item = T>,
+) -> impl Iterator<Item = T> {
+    args.filter(|arg| !is_http_tunnel_arg(arg.as_ref()))
+}
 
 pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
@@ -109,11 +121,18 @@ lazy_static::lazy_static! {
 }
 
 pub fn process_args() -> impl Iterator<Item = String> {
-    hbb_common::without_diagnostic_log_arg(std::env::args())
+    without_http_tunnel_arg(hbb_common::without_diagnostic_log_arg(std::env::args()))
 }
 
 pub fn process_args_os() -> impl Iterator<Item = std::ffi::OsString> {
-    std::env::args_os().filter(|arg| arg != std::ffi::OsStr::new(hbb_common::DIAGNOSTIC_LOG_ARG))
+    without_http_tunnel_arg(std::env::args_os().filter(|arg| {
+        arg != std::ffi::OsStr::new(hbb_common::DIAGNOSTIC_LOG_ARG)
+    }))
+}
+
+#[inline]
+pub fn is_http_tunnel_requested() -> bool {
+    std::env::args_os().any(|arg| is_http_tunnel_arg(&arg))
 }
 
 pub struct SimpleCallOnReturn {
@@ -3114,5 +3133,20 @@ mod tests {
         let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
         assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
         assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
+    }
+
+    #[test]
+    fn test_http_tunnel_arg_is_not_positional() {
+        assert!(is_http_tunnel_arg(std::ffi::OsStr::new(HTTP_TUNNEL_ARG)));
+        assert!(!is_http_tunnel_arg(std::ffi::OsStr::new("--server")));
+
+        for (args, expected) in [
+            (["telemost", HTTP_TUNNEL_ARG, "--server"], "--server"),
+            (["telemost", "--server", HTTP_TUNNEL_ARG], "--server"),
+            (["telemost", HTTP_TUNNEL_ARG, "--version"], "--version"),
+        ] {
+            let filtered: Vec<_> = without_http_tunnel_arg(args.into_iter()).collect();
+            assert_eq!(filtered, ["telemost", expected]);
+        }
     }
 }
