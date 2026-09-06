@@ -34,6 +34,10 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     poll_wait_sec: u64,
 
+    /// Optional loopback HTTP backend for public dashboard routes.
+    #[arg(long, value_name = "URL")]
+    dashboard_backend: Option<String>,
+
     /// Extra Subject Alternative Names for the self-signed cert (repeatable).
     /// Ignored when --tls-cert/--tls-key provide a real certificate.
     #[arg(long = "san", value_name = "HOST")]
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         keepalive: Duration::from_secs(args.keepalive_sec.max(1)),
         timeout: Duration::from_secs(args.timeout_sec.max(1)),
         poll_wait: Duration::from_secs(args.poll_wait_sec.max(1)),
+        dashboard_backend: args.dashboard_backend.clone(),
         sans,
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),

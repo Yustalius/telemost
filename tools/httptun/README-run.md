@@ -87,6 +87,27 @@ curl -k https://127.0.0.1/health
 Сервис должен запускать сервер на `0.0.0.0:443`; hbbs/hbbr должны быть доступны на
 loopback-портах `21115`, `21116`, `21117`.
 
+### Локальный dashboard за тем же HTTPS-адресом
+
+Если dashboard уже слушает только loopback по HTTP, сервер туннеля может передать
+ему все публичные маршруты. Укажите literal loopback URL без пути и без секретов:
+
+```bash
+/opt/httptun/httptun-server \
+  --listen 0.0.0.0:443 \
+  --dashboard-backend http://127.0.0.1:8080
+```
+
+Допустимы только HTTP URL с literal-адресом из `127.0.0.0/8` или `[::1]`; URL с
+именем хоста, userinfo, query, fragment или непустым path сервер отвергает на
+старте. Без `--dashboard-backend` публичные маршруты, включая `/`, отвечают 404.
+
+`/api/v1` и вложенные пути, `/health`, а также точные legacy-пути `/o`, `/u`,
+`/d`, `/c` остаются маршрутам туннеля и не передаются dashboard. Proxy не
+поддерживает CONNECT и HTTP Upgrade. Он передаёт метод, path/query, тело и
+сквозные HTTP-заголовки, включая `Authorization`, cookies и `Host`; backend
+должен сам использовать `PUBLIC_ORIGIN` для публичных ссылок и редиректов.
+
 ## Фаза 1: проверка без VPN
 
 Запустить новую сборку Telemost без proxy-env. Для нативного debug-бинаря:

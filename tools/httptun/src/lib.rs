@@ -32,6 +32,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use http::{HeaderMap, HeaderName, Uri};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
@@ -43,6 +44,8 @@ const READ_BUF: usize = 32 * 1024;
 const MAX_BATCH: usize = 256 * 1024;
 const SESSION_IDLE: Duration = Duration::from_secs(300);
 const LOCAL_BIND_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const DASHBOARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DASHBOARD_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Shared config types
@@ -136,6 +139,7 @@ pub struct ServerConfig {
     pub keepalive: Duration,
     pub timeout: Duration,
     pub poll_wait: Duration,
+    pub dashboard_backend: Option<String>,
     pub sans: Vec<String>,
     /// PEM certificate chain; when both this and `tls_key` are set the server
     /// serves that certificate instead of a startup self-signed one.
@@ -475,10 +479,18 @@ struct ServerOpts {
     keepalive: Duration,
     timeout: Duration,
     poll_wait: Duration,
+    dashboard: Option<DashboardBackend>,
     auth_token: Option<Arc<str>>,
     max_sessions: usize,
     allow_legacy: bool,
     routes: Arc<HashMap<String, Route>>,
+}
+
+#[derive(Clone)]
+struct DashboardBackend {
+    base: reqwest::Url,
+    client: reqwest::Client,
+    progress_timeout: Duration,
 }
 
 pub async fn run_server(cfg: ServerConfig) -> Result<()> {
@@ -502,11 +514,17 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         .collect();
 
     let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let dashboard = cfg
+        .dashboard_backend
+        .as_deref()
+        .map(DashboardBackend::new)
+        .transpose()?;
     let opts = ServerOpts {
         echo_all: cfg.echo_all,
         keepalive: cfg.keepalive,
         timeout: cfg.timeout,
         poll_wait: cfg.poll_wait,
+        dashboard,
         auth_token: cfg.auth_token.as_deref().map(Arc::from),
         max_sessions: cfg.max_sessions.max(1),
         allow_legacy: cfg.allow_legacy,
@@ -516,12 +534,13 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
     spawn_sweeper(reg.clone());
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, legacy={}, routes={}, max_sessions={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, legacy={}, dashboard={}, routes={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
         cfg.echo_all,
         opts.auth_token.is_some(),
         opts.allow_legacy,
+        opts.dashboard.is_some(),
         opts.routes.len(),
         opts.max_sessions,
     );
@@ -583,33 +602,252 @@ async fn handle(
 ) -> Result<Response<BoxBody>, Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-    log::debug!("--> {method} {path}?{query}");
+    log::debug!("--> {method} {path}");
 
     // Every /api/v1/* request must carry the shared bearer token (when set).
-    if path.starts_with("/api/v1/") && !authorized(&req, &opts) {
+    if (path == "/api/v1" || path.starts_with("/api/v1/")) && !authorized(&req, &opts) {
         let resp = text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n");
         log::debug!("<-- {method} {path} {}", resp.status());
         return Ok(resp);
     }
 
-    let resp = match (&method, path.as_str()) {
-        // v1 API — opaque routes, bearer auth, web-app-shaped paths.
-        (&Method::POST, "/api/v1/session/open") => handle_open_v1(req, &reg, &opts).await,
-        (&Method::POST, "/api/v1/session/send") => handle_up(req, &reg).await,
-        (&Method::GET, "/api/v1/session/recv") => handle_down(req, &reg, &opts).await,
-        (&Method::POST, "/api/v1/session/close") => handle_close(req, &reg).await,
-        // Legacy API — arbitrary X-Target, migration window only.
-        (&Method::POST, "/o") if opts.allow_legacy => handle_open(req, &reg, &opts).await,
-        (&Method::POST, "/u") if opts.allow_legacy => handle_up(req, &reg).await,
-        (&Method::GET, "/d") if opts.allow_legacy => handle_down(req, &reg, &opts).await,
-        (&Method::POST, "/c") if opts.allow_legacy => handle_close(req, &reg).await,
-        (&Method::GET, "/") => decoy_resp(),
-        (&Method::GET, "/health") => text_resp(StatusCode::OK, "ok\n"),
-        _ => text_resp(StatusCode::NOT_FOUND, "not found\n"),
+    let resp = if path == "/api/v1" || path.starts_with("/api/v1/") {
+        match (&method, path.as_str()) {
+            (&Method::POST, "/api/v1/session/open") => handle_open_v1(req, &reg, &opts).await,
+            (&Method::POST, "/api/v1/session/send") => handle_up(req, &reg).await,
+            (&Method::GET, "/api/v1/session/recv") => handle_down(req, &reg, &opts).await,
+            (&Method::POST, "/api/v1/session/close") => handle_close(req, &reg).await,
+            (_, "/api/v1/session/open") => method_not_allowed("POST", method == Method::HEAD),
+            (_, "/api/v1/session/send") => method_not_allowed("POST", method == Method::HEAD),
+            (_, "/api/v1/session/recv") => method_not_allowed("GET", method == Method::HEAD),
+            (_, "/api/v1/session/close") => method_not_allowed("POST", method == Method::HEAD),
+            _ => neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD),
+        }
+    } else if matches!(path.as_str(), "/o" | "/u" | "/d" | "/c") {
+        if !opts.allow_legacy {
+            neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD)
+        } else {
+            match (&method, path.as_str()) {
+                (&Method::POST, "/o") => handle_open(req, &reg, &opts).await,
+                (&Method::POST, "/u") => handle_up(req, &reg).await,
+                (&Method::GET, "/d") => handle_down(req, &reg, &opts).await,
+                (&Method::POST, "/c") => handle_close(req, &reg).await,
+                (_, "/d") => method_not_allowed("GET", method == Method::HEAD),
+                _ => method_not_allowed("POST", method == Method::HEAD),
+            }
+        }
+    } else if path == "/health" {
+        match method {
+            Method::GET => text_resp(StatusCode::OK, "ok\n"),
+            Method::HEAD => neutral_resp(StatusCode::OK, true),
+            _ => method_not_allowed("GET, HEAD", false),
+        }
+    } else if method == Method::CONNECT {
+        method_not_allowed("GET, HEAD", false)
+    } else if has_upgrade(req.headers()) {
+        neutral_resp(StatusCode::BAD_REQUEST, method == Method::HEAD)
+    } else if let Some(dashboard) = &opts.dashboard {
+        match dashboard.forward(req).await {
+            Ok(resp) => resp,
+            Err(DashboardError::InvalidRequest) => neutral_resp(StatusCode::BAD_REQUEST, method == Method::HEAD),
+            Err(DashboardError::Timeout) => neutral_resp(StatusCode::GATEWAY_TIMEOUT, method == Method::HEAD),
+            Err(DashboardError::Unavailable) => neutral_resp(StatusCode::BAD_GATEWAY, method == Method::HEAD),
+        }
+    } else {
+        neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD)
     };
     log::debug!("<-- {method} {path} {}", resp.status());
     Ok(resp)
+}
+
+fn neutral_resp(status: StatusCode, head: bool) -> Response<BoxBody> {
+    if head {
+        let mut response = Response::new(full(Bytes::new()));
+        *response.status_mut() = status;
+        response
+    } else {
+        text_resp(status, "\n")
+    }
+}
+
+fn method_not_allowed(allow: &'static str, head: bool) -> Response<BoxBody> {
+    let mut response = neutral_resp(StatusCode::METHOD_NOT_ALLOWED, head);
+    response.headers_mut().insert(
+        http::header::ALLOW,
+        http::HeaderValue::from_static(allow),
+    );
+    response
+}
+
+enum DashboardError {
+    InvalidRequest,
+    Timeout,
+    Unavailable,
+}
+
+impl DashboardBackend {
+    fn new(value: &str) -> Result<Self> {
+        let base = reqwest::Url::parse(value).context("invalid dashboard backend")?;
+        let has_userinfo = value
+            .split_once("://")
+            .map(|(_, rest)| {
+                let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                rest[..authority_end].contains('@')
+            })
+            .unwrap_or(false);
+        let is_loopback = base
+            .host_str()
+            .map(|host| host.trim_matches(['[', ']']))
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+        if base.scheme() != "http"
+            || !is_loopback
+            || has_userinfo
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.path() != "/"
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
+            bail!("dashboard backend must be an http loopback URL with root path");
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .connect_timeout(DASHBOARD_CONNECT_TIMEOUT)
+            .build()
+            .context("building dashboard client")?;
+        Ok(Self {
+            base,
+            client,
+            progress_timeout: DASHBOARD_PROGRESS_TIMEOUT,
+        })
+    }
+
+    async fn forward(&self, req: Request<Incoming>) -> std::result::Result<Response<BoxBody>, DashboardError> {
+        let (parts, body) = req.into_parts();
+        let url = self.url_for(&parts.uri).ok_or(DashboardError::InvalidRequest)?;
+        let head = parts.method == Method::HEAD;
+        let headers = end_to_end_headers(&parts.headers, true);
+        let (body, mut progress) = dashboard_body(body);
+        let mut upstream = reqwest::Request::new(parts.method, url);
+        *upstream.headers_mut() = headers;
+        *upstream.body_mut() = Some(body);
+
+        let send = self.client.execute(upstream);
+        tokio::pin!(send);
+        let deadline = tokio::time::sleep(self.progress_timeout);
+        tokio::pin!(deadline);
+        let mut upload_open = true;
+        let response = loop {
+            tokio::select! {
+                result = &mut send => break result.map_err(|_| DashboardError::Unavailable)?,
+                progress_update = progress.recv(), if upload_open => match progress_update {
+                    Some(()) => deadline.as_mut().reset(tokio::time::Instant::now() + self.progress_timeout),
+                    None => upload_open = false,
+                },
+                _ = &mut deadline => return Err(DashboardError::Timeout),
+            }
+        };
+        Ok(proxy_response(response, head))
+    }
+
+    fn url_for(&self, uri: &Uri) -> Option<reqwest::Url> {
+        if uri.scheme().is_some() || uri.authority().is_some() {
+            return None;
+        }
+        let path_and_query = uri.path_and_query()?.as_str();
+        if !path_and_query.starts_with('/') || path_and_query.starts_with("//") {
+            return None;
+        }
+        reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base.as_str().trim_end_matches('/'),
+            path_and_query
+        ))
+        .ok()
+    }
+}
+
+fn dashboard_body(body: Incoming) -> (reqwest::Body, tokio::sync::mpsc::UnboundedReceiver<()>) {
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _ = progress_tx.send(());
+        chunk.map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+    });
+    (reqwest::Body::wrap_stream(stream), progress_rx)
+}
+
+fn proxy_response(response: reqwest::Response, head: bool) -> Response<BoxBody> {
+    let status = response.status();
+    let headers = end_to_end_headers(response.headers(), false);
+    if head {
+        let mut proxied = Response::new(full(Bytes::new()));
+        *proxied.status_mut() = status;
+        *proxied.headers_mut() = headers;
+        return proxied;
+    }
+    let stream = response.bytes_stream().map(|chunk| {
+        chunk
+            .map(BodyFrame::data)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+    });
+    let mut proxied = Response::new(BodyExt::boxed(StreamBody::new(stream)));
+    *proxied.status_mut() = status;
+    *proxied.headers_mut() = headers;
+    proxied
+}
+
+fn end_to_end_headers(headers: &HeaderMap, request: bool) -> HeaderMap {
+    let nominated = connection_nominated_headers(headers);
+    let mut filtered = HeaderMap::new();
+    for (name, value) in headers {
+        let name_text = name.as_str();
+        if is_hop_by_hop(name, &nominated)
+            || (request
+                && (name_text.eq_ignore_ascii_case("forwarded")
+                    || name_text.to_ascii_lowercase().starts_with("x-forwarded-")))
+        {
+            continue;
+        }
+        filtered.append(name.clone(), value.clone());
+    }
+    filtered
+}
+
+fn connection_nominated_headers(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| HeaderName::from_bytes(value.trim().as_bytes()).ok())
+        .collect()
+}
+
+fn is_hop_by_hop(name: &HeaderName, nominated: &[HeaderName]) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || nominated.iter().any(|nominated_name| nominated_name == name)
+}
+
+fn has_upgrade(headers: &HeaderMap) -> bool {
+    headers.contains_key(http::header::UPGRADE)
+        || connection_nominated_headers(headers)
+            .iter()
+            .any(|name| name == http::header::UPGRADE)
 }
 
 fn authorized(req: &Request<Incoming>, opts: &ServerOpts) -> bool {
@@ -623,16 +861,6 @@ fn authorized(req: &Request<Incoming>, opts: &ServerOpts) -> bool {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|got| got == expected.as_ref())
         .unwrap_or(false)
-}
-
-fn decoy_resp() -> Response<BoxBody> {
-    let body = "<!doctype html><title>ya-telemost</title><h1>It works</h1>\n";
-    let mut response = Response::new(full(Bytes::from_static(body.as_bytes())));
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    response
 }
 
 async fn handle_open(
@@ -2259,6 +2487,7 @@ mod tests {
             keepalive: Duration::from_secs(15),
             timeout: Duration::from_secs(30),
             poll_wait: Duration::from_secs(5),
+            dashboard: None,
             auth_token: None,
             max_sessions: 1,
             allow_legacy: false,
@@ -2268,6 +2497,185 @@ mod tests {
         let response = handle_down_batch(session, &opts).await;
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, encode_data(b"ready"));
+    }
+
+    #[test]
+    fn dashboard_backend_requires_literal_loopback_http_root() {
+        for valid in ["http://127.0.0.1:8080", "http://127.2.3.4/", "http://[::1]:8080/"] {
+            assert!(DashboardBackend::new(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "https://127.0.0.1:8080/",
+            "http://localhost:8080/",
+            "http://127.0.0.1:8080/dashboard",
+            "http://user@127.0.0.1:8080/",
+            "http://@127.0.0.1:8080/",
+            "http://127.0.0.1:8080/?query",
+            "http://127.0.0.1:8080/#fragment",
+            "http://192.168.1.1:8080/",
+        ] {
+            assert!(DashboardBackend::new(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn dashboard_url_keeps_path_query_without_accepting_authority() {
+        let dashboard = DashboardBackend::new("http://127.0.0.1:8080/").unwrap();
+        assert_eq!(
+            dashboard
+                .url_for(&"/asset?a=1&b=two".parse().unwrap())
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8080/asset?a=1&b=two"
+        );
+        assert!(dashboard.url_for(&"//other.test/path".parse().unwrap()).is_none());
+        assert!(dashboard
+            .url_for(&"http://other.test/path".parse().unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn dashboard_header_filtering_keeps_end_to_end_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic abc".parse().unwrap());
+        headers.append("cookie", "first=1".parse().unwrap());
+        headers.append("cookie", "second=2".parse().unwrap());
+        headers.insert("host", "public.example".parse().unwrap());
+        headers.insert("forwarded", "for=attacker".parse().unwrap());
+        headers.insert("x-forwarded-for", "attacker".parse().unwrap());
+        headers.insert("connection", "keep-alive, x-remove".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("x-remove", "gone".parse().unwrap());
+        headers.append("set-cookie", "one=1".parse().unwrap());
+        headers.append("set-cookie", "two=2".parse().unwrap());
+
+        let request = end_to_end_headers(&headers, true);
+        assert_eq!(request.get("authorization").unwrap(), "Basic abc");
+        assert_eq!(request.get("host").unwrap(), "public.example");
+        assert_eq!(request.get_all("cookie").iter().count(), 2);
+        assert!(!request.contains_key("forwarded"));
+        assert!(!request.contains_key("x-forwarded-for"));
+        assert!(!request.contains_key("connection"));
+        assert!(!request.contains_key("keep-alive"));
+        assert!(!request.contains_key("x-remove"));
+
+        let response = end_to_end_headers(&headers, false);
+        assert_eq!(response.get_all("set-cookie").iter().count(), 2);
+        assert!(response.contains_key("authorization"));
+        assert!(!response.contains_key("connection"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_header_deadline_returns_gateway_timeout() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = backend.accept().await.unwrap();
+            let service = service_fn(|_req: Request<Incoming>| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"late"))))
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mut dashboard = DashboardBackend::new(&format!("http://127.0.0.1:{backend_port}/")).unwrap();
+        dashboard.progress_timeout = Duration::from_millis(20);
+        let opts = ServerOpts {
+            echo_all: false,
+            keepalive: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            poll_wait: Duration::from_secs(1),
+            dashboard: Some(dashboard),
+            auth_token: None,
+            max_sessions: 1,
+            allow_legacy: false,
+            routes: Arc::new(HashMap::new()),
+        };
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let service = service_fn(move |req| {
+                let opts = opts.clone();
+                let reg = reg.clone();
+                async move { handle(req, reg, opts).await }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{proxy_port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn dashboard_upload_progress_extends_header_deadline() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = backend.accept().await.unwrap();
+            let service = service_fn(|req: Request<Incoming>| async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(body, Bytes::from_static(b"xxxx"));
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mut dashboard = DashboardBackend::new(&format!("http://127.0.0.1:{backend_port}/")).unwrap();
+        dashboard.progress_timeout = Duration::from_millis(35);
+        let opts = ServerOpts {
+            echo_all: false,
+            keepalive: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            poll_wait: Duration::from_secs(1),
+            dashboard: Some(dashboard),
+            auth_token: None,
+            max_sessions: 1,
+            allow_legacy: false,
+            routes: Arc::new(HashMap::new()),
+        };
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let service = service_fn(move |req| {
+                let opts = opts.clone();
+                let reg = reg.clone();
+                async move { handle(req, reg, opts).await }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let stream = futures::stream::unfold(0_u8, |part| async move {
+            if part == 4 {
+                None
+            } else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((Ok::<_, io::Error>(Bytes::from_static(b"x")), part + 1))
+            }
+        });
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/upload"))
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), "ok");
     }
 
     #[cfg(windows)]

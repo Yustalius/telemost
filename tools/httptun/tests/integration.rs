@@ -9,12 +9,119 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::StreamExt;
 use httptun::{
     run_server_on, run_tcp_mapping_on, run_udp_mapping_on, ClientConfig, Mode, ProxyOpt, Route,
     ServerConfig, Transport, WireApi,
 };
+use http_body::Frame;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+struct DashboardRequest {
+    method: String,
+    path_and_query: String,
+    headers: http::HeaderMap,
+    body: Bytes,
+}
+
+async fn spawn_dashboard_backend() -> (u16, tokio::sync::mpsc::UnboundedReceiver<DashboardRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let tx = tx.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body = body.collect().await.unwrap().to_bytes();
+                        let path_and_query = parts
+                            .uri
+                            .path_and_query()
+                            .map(|v| v.as_str().to_owned())
+                            .unwrap_or_default();
+                        let _ = tx.send(DashboardRequest {
+                            method: parts.method.to_string(),
+                            path_and_query: path_and_query.clone(),
+                            headers: parts.headers,
+                            body,
+                        });
+                        let mut response = Response::new(Full::new(Bytes::from_static(b"backend-body")));
+                        match path_and_query.as_str() {
+                            "/auth" => {
+                                *response.status_mut() = StatusCode::UNAUTHORIZED;
+                                response.headers_mut().append("www-authenticate", "Basic realm=\"test\"".parse().unwrap());
+                                response.headers_mut().append("set-cookie", "one=1".parse().unwrap());
+                                response.headers_mut().append("set-cookie", "two=2".parse().unwrap());
+                            }
+                            "/redirect" => {
+                                *response.status_mut() = StatusCode::FOUND;
+                                response.headers_mut().insert("location", "/next".parse().unwrap());
+                            }
+                            _ => {}
+                        }
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (port, rx)
+}
+
+async fn spawn_streaming_dashboard_backend() -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let service = service_fn(move |_req: Request<Incoming>| {
+            let release = release_rx.lock().ok().and_then(|mut slot| slot.take());
+            async move {
+                let stream = futures::stream::unfold((false, release), |(sent, release)| async move {
+                    if !sent {
+                        Some((
+                            Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"event: ready\n\n"))),
+                            (true, release),
+                        ))
+                    } else {
+                        if let Some(release) = release {
+                            let _ = release.await;
+                        }
+                        None
+                    }
+                });
+                let mut response = Response::new(BodyExt::boxed(StreamBody::new(stream)));
+                response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+                response.headers_mut().insert("cache-control", "no-store".parse().unwrap());
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+    (port, release_tx)
+}
 
 fn any_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -70,6 +177,7 @@ fn base_server_cfg(echo_all: bool) -> ServerConfig {
         keepalive: Duration::from_secs(5),
         timeout: Duration::from_secs(5),
         poll_wait: Duration::from_secs(1),
+        dashboard_backend: None,
         sans: vec!["localhost".into(), "127.0.0.1".into()],
         tls_cert: None,
         tls_key: None,
@@ -91,6 +199,151 @@ async fn spawn_server_with(cfg: ServerConfig) -> u16 {
 
 async fn spawn_server(echo_all: bool) -> u16 {
     spawn_server_with(base_server_cfg(echo_all)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_proxy_forwards_public_requests_and_preserves_backend_responses() {
+    let (backend_port, mut observed) = spawn_dashboard_backend().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.dashboard_backend = Some(format!("http://127.0.0.1:{backend_port}/"));
+    cfg.allow_legacy = false;
+    let server_port = spawn_server_with(cfg).await;
+    let base = format!("https://127.0.0.1:{server_port}");
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/asset?version=7"))
+        .header("authorization", "Basic preserved")
+        .header("cookie", "session=abc")
+        .header("host", "public.example")
+        .header("forwarded", "for=spoofed")
+        .header("x-forwarded-for", "spoofed")
+        .header("connection", "x-remove")
+        .header("x-remove", "gone")
+        .body("streamed request")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap(), "backend-body");
+    let request = tokio::time::timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path_and_query, "/asset?version=7");
+    assert_eq!(request.headers.get("authorization").unwrap(), "Basic preserved");
+    assert_eq!(request.headers.get("cookie").unwrap(), "session=abc");
+    assert_eq!(request.headers.get("host").unwrap(), "public.example");
+    assert!(!request.headers.contains_key("forwarded"));
+    assert!(!request.headers.contains_key("x-forwarded-for"));
+    assert!(!request.headers.contains_key("connection"));
+    assert!(!request.headers.contains_key("x-remove"));
+    assert_eq!(request.body, "streamed request");
+
+    let response = client.get(format!("{base}/auth")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers().get_all("www-authenticate").iter().count(), 1);
+    assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+
+    let response = client.get(format!("{base}/redirect")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.headers().get("location").unwrap(), "/next");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_proxy_keeps_reserved_paths_local_and_handles_head_and_failures() {
+    let (backend_port, mut observed) = spawn_dashboard_backend().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.dashboard_backend = Some(format!("http://127.0.0.1:{backend_port}/"));
+    cfg.allow_legacy = false;
+    let server_port = spawn_server_with(cfg).await;
+    let base = format!("https://127.0.0.1:{server_port}");
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    for path in ["/api/v1", "/api/v1/unknown", "/o"] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client.head(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().len(), 0);
+    let response = client.post(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers().get("allow").unwrap(), "GET, HEAD");
+    assert!(tokio::time::timeout(Duration::from_millis(100), observed.recv())
+        .await
+        .is_err(), "reserved route reached dashboard backend");
+
+    let response = client.head(format!("{base}/asset")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "12");
+    assert_eq!(response.bytes().await.unwrap().len(), 0);
+
+    let no_backend_port = spawn_server_with(base_server_cfg(false)).await;
+    let response = client
+        .get(format!("https://127.0.0.1:{no_backend_port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let mut unavailable_cfg = base_server_cfg(false);
+    unavailable_cfg.dashboard_backend = Some(format!("http://127.0.0.1:{closed_port}/"));
+    let unavailable_port = spawn_server_with(unavailable_cfg).await;
+    let response = client
+        .get(format!("https://127.0.0.1:{unavailable_port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_proxy_streams_response_before_backend_eof() {
+    let (backend_port, release_eof) = spawn_streaming_dashboard_backend().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.dashboard_backend = Some(format!("http://127.0.0.1:{backend_port}/"));
+    let server_port = spawn_server_with(cfg).await;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    let response = client
+        .get(format!("https://127.0.0.1:{server_port}/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "text/event-stream");
+    let mut body = response.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("first stream chunk was buffered until EOF")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, "event: ready\n\n");
+    release_eof.send(()).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(1), body.next())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 fn client_config(server_port: u16, mode: Mode, proxy: ProxyOpt) -> ClientConfig {
