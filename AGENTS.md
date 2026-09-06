@@ -61,6 +61,14 @@
 * Do not make formatting-only changes.
 * Keep naming/style consistent with nearby code.
 
+## Release build policy
+
+* A user-requested build or pipeline must publish a GitHub Release.
+* Invoke builds with `upload-artifact=true` explicitly; never silently choose `false`.
+* Default to `desktop_only=true` unless the user requests other platforms.
+* Set `upload-tag` to an explicit target or use the `manual` default.
+* Do not monitor runs when the user asks not to monitor them.
+
 ### Comments
 
 * Avoid comments unless they explain a non-obvious reason, constraint, or workaround.

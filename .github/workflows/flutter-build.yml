@@ -21,7 +21,7 @@ on:
         default: true
       upload-artifact:
         type: boolean
-        default: false
+        default: true
       upload-tag:
         type: string
         default: "manual"
