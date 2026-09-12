@@ -5,8 +5,8 @@ use std::time::Duration;
 use clap::Parser;
 use httptun::{run_server, telemost_preset_routes, Mode, ServerConfig};
 
-/// HTTP-streaming tunnel server: bridges each HTTP session to a TCP or UDP target
-/// (from the `X-Target` header) or to a built-in echo responder.
+/// HTTP-streaming tunnel server: bridges each fixed route to a TCP or UDP target
+/// or to a built-in echo responder.
 #[derive(Parser, Debug)]
 #[command(name = "httptun-server", version, about)]
 struct Args {
@@ -14,7 +14,7 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:443")]
     listen: SocketAddr,
 
-    /// Route every session to the built-in echo responder, ignoring X-Target.
+    /// Route every session to the built-in echo responder.
     #[arg(long)]
     echo: bool,
 
@@ -59,10 +59,6 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     max_sessions: usize,
 
-    /// Also accept the legacy /o /u /d /c + X-Target API (migration only).
-    #[arg(long)]
-    allow_legacy: bool,
-
     /// Public host the relay route dials (hbbr rejects loopback-origin relays).
     #[arg(long, default_value = "201.24.52.171")]
     relay_host: String,
@@ -97,7 +93,6 @@ async fn main() -> anyhow::Result<()> {
         tls_key: args.tls_key.clone(),
         auth_token: args.auth_token.clone(),
         max_sessions: args.max_sessions,
-        allow_legacy: args.allow_legacy,
         routes: telemost_preset_routes(&args.relay_host),
     };
     run_server(cfg).await
@@ -111,4 +106,14 @@ fn httptun_init_log(verbose: u8) {
     };
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| format!("httptun={level}"));
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter)).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_legacy_option_is_rejected() {
+        assert!(Args::try_parse_from(["httptun-server", "--allow-legacy"]).is_err());
+    }
 }

@@ -128,9 +128,6 @@ pub enum WireApi {
     V1 { token: Option<String> },
     /// v2: sequenced batch requests with acknowledgements and replay safety.
     V2 { token: Option<String> },
-    /// Legacy: `/o /u /d /c` with an arbitrary `X-Target`. Kept only for the
-    /// migration window; the server accepts it only under `allow_legacy`.
-    Legacy,
 }
 
 impl WireApi {
@@ -138,35 +135,30 @@ impl WireApi {
         match self {
             WireApi::V1 { .. } => "/api/v1/session/open",
             WireApi::V2 { .. } => "/api/v2/session/open",
-            WireApi::Legacy => "/o",
         }
     }
     fn send_path(&self) -> &'static str {
         match self {
             WireApi::V1 { .. } => "/api/v1/session/send",
             WireApi::V2 { .. } => "/api/v2/session/send",
-            WireApi::Legacy => "/u",
         }
     }
     fn recv_path(&self) -> &'static str {
         match self {
             WireApi::V1 { .. } => "/api/v1/session/recv",
             WireApi::V2 { .. } => "/api/v2/session/recv",
-            WireApi::Legacy => "/d",
         }
     }
     fn close_path(&self) -> &'static str {
         match self {
             WireApi::V1 { .. } => "/api/v1/session/close",
             WireApi::V2 { .. } => "/api/v2/session/close",
-            WireApi::Legacy => "/c",
         }
     }
 }
 
-/// A fixed server-side route: the v1 client asks for it by opaque `id`, and the
-/// server dials the associated target. Replaces the arbitrary `X-Target` so the
-/// server is not an open proxy.
+/// A fixed server-side route: the client asks for it by opaque `id`, and the
+/// server dials the associated target so the server cannot act as an open proxy.
 #[derive(Clone, Debug)]
 pub struct Route {
     pub id: String,
@@ -194,8 +186,6 @@ pub struct ServerConfig {
     pub auth_token: Option<String>,
     /// Upper bound on concurrent sessions; opens past it are refused with 429.
     pub max_sessions: usize,
-    /// Accept the legacy `/o /u /d /c` + `X-Target` API (migration only).
-    pub allow_legacy: bool,
     /// Fixed v1 routes the server will dial by id.
     pub routes: Vec<Route>,
 }
@@ -350,40 +340,6 @@ pub fn telemost_preset_routes(relay_host: &str) -> Vec<Route> {
         Route {
             id: ROUTE_RELAY.to_owned(),
             transport: Transport::Tcp,
-            target: relay_target,
-        },
-    ]
-}
-
-pub fn telemost_preset_maps(relay_host: &str) -> Vec<PortMap> {
-    // hbbr rejects relay requests that arrive from a loopback source, so the
-    // relay target must be the VPS's public address: the tunnel server dials it
-    // and hbbr then sees a non-loopback peer. hbbs (rendezvous / NAT-test) does
-    // accept loopback, so those stay on 127.0.0.1 to avoid an extra hairpin.
-    let relay_target = if relay_host.contains(':') {
-        format!("[{relay_host}]:21117")
-    } else {
-        format!("{relay_host}:21117")
-    };
-    vec![
-        PortMap {
-            transport: Transport::Udp,
-            local_port: 23456,
-            target: "127.0.0.1:21116".to_owned(),
-        },
-        PortMap {
-            transport: Transport::Tcp,
-            local_port: 23456,
-            target: "127.0.0.1:21116".to_owned(),
-        },
-        PortMap {
-            transport: Transport::Tcp,
-            local_port: 23455,
-            target: "127.0.0.1:21115".to_owned(),
-        },
-        PortMap {
-            transport: Transport::Tcp,
-            local_port: 23457,
             target: relay_target,
         },
     ]
@@ -706,7 +662,6 @@ struct ServerOpts {
     dashboard: Option<DashboardBackend>,
     auth_token: Option<Arc<str>>,
     max_sessions: usize,
-    allow_legacy: bool,
     routes: Arc<HashMap<String, Route>>,
     admission: Arc<tokio::sync::Semaphore>,
     claims: VersionClaims,
@@ -756,7 +711,6 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         dashboard,
         auth_token: cfg.auth_token.as_deref().map(Arc::from),
         max_sessions: cfg.max_sessions.max(1),
-        allow_legacy: cfg.allow_legacy,
         routes: Arc::new(routes),
         admission: Arc::new(tokio::sync::Semaphore::new(cfg.max_sessions.max(1))),
         claims,
@@ -768,12 +722,11 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
     spawn_claim_sweeper(opts.claims.clone());
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, legacy={}, dashboard={}, routes={}, max_sessions={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
         cfg.echo_all,
         opts.auth_token.is_some(),
-        opts.allow_legacy,
         opts.dashboard.is_some(),
         opts.routes.len(),
         opts.max_sessions,
@@ -984,18 +937,7 @@ async fn handle(
             _ => neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD),
         }
     } else if matches!(path.as_str(), "/o" | "/u" | "/d" | "/c") {
-        if !opts.allow_legacy {
-            neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD)
-        } else {
-            match (&method, path.as_str()) {
-                (&Method::POST, "/o") => handle_open(req, &reg, &opts).await,
-                (&Method::POST, "/u") => handle_up(req, &reg).await,
-                (&Method::GET, "/d") => handle_down(req, &reg, &opts).await,
-                (&Method::POST, "/c") => handle_close(req, &reg, &opts).await,
-                (_, "/d") => method_not_allowed("GET", method == Method::HEAD),
-                _ => method_not_allowed("POST", method == Method::HEAD),
-            }
-        }
+        neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD)
     } else if path == "/health" {
         match method {
             Method::GET => text_resp(StatusCode::OK, "ok\n"),
@@ -1329,28 +1271,6 @@ async fn release_claim_if_matches(
     }
 }
 
-async fn handle_open(
-    req: Request<Incoming>,
-    reg: &Registry,
-    opts: &ServerOpts,
-) -> Response<BoxBody> {
-    let sid = match query_param(req.uri(), "s") {
-        Some(s) if !s.is_empty() => s,
-        _ => return text_resp(StatusCode::BAD_REQUEST, "missing session id\n"),
-    };
-    let target = req
-        .headers()
-        .get("x-target")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let target = match target {
-        Some(t) if !t.is_empty() => t,
-        _ => return text_resp(StatusCode::BAD_REQUEST, "missing X-Target\n"),
-    };
-
-    open_with_limit(reg, sid, target, opts).await
-}
-
 async fn handle_open_v1(
     req: Request<Incoming>,
     reg: &Registry,
@@ -1416,43 +1336,6 @@ fn resolve_route(route: &str, opts: &ServerOpts) -> Option<String> {
     opts.routes
         .get(route)
         .map(|r| format!("{}://{}", r.transport.as_str(), r.target))
-}
-
-async fn open_with_limit(
-    reg: &Registry,
-    sid: String,
-    target: String,
-    opts: &ServerOpts,
-) -> Response<BoxBody> {
-    {
-        let guard = reg.lock().await;
-        if guard.contains_key(&sid) {
-            return text_resp(StatusCode::OK, "");
-        }
-        if guard.len() >= opts.max_sessions {
-            return text_resp(StatusCode::TOO_MANY_REQUESTS, "session limit reached\n");
-        }
-    }
-
-    match open_session(reg, sid, target, opts).await {
-        Ok(()) => text_resp(StatusCode::OK, ""),
-        Err((code, msg)) => text_resp(code, &msg),
-    }
-}
-
-async fn open_session(
-    reg: &Registry,
-    sid: String,
-    target: String,
-    opts: &ServerOpts,
-) -> std::result::Result<(), (StatusCode, String)> {
-    let admission = opts.admission.clone().try_acquire_owned().map_err(|_| {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            "session limit reached\n".to_owned(),
-        )
-    })?;
-    open_session_with_admission(reg, sid, target, opts, admission, None).await
 }
 
 async fn open_session_with_admission(
@@ -1523,13 +1406,13 @@ fn parse_target(target: &str) -> std::result::Result<TargetSpec, (StatusCode, St
     let (transport, address) = target.split_once("://").ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            "X-Target must be echo, tcp://host:port, or udp://host:port\n".to_owned(),
+            "route target must be echo, tcp://host:port, or udp://host:port\n".to_owned(),
         )
     })?;
     validate_host_port(address).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            format!("invalid X-Target {target}: {error}\n"),
+            format!("invalid route target {target}: {error}\n"),
         )
     })?;
     match transport.to_ascii_lowercase().as_str() {
@@ -1537,7 +1420,7 @@ fn parse_target(target: &str) -> std::result::Result<TargetSpec, (StatusCode, St
         "udp" => Ok(TargetSpec::Udp(address.to_owned())),
         _ => Err((
             StatusCode::BAD_REQUEST,
-            format!("unsupported X-Target protocol {transport}\n"),
+            format!("unsupported route target protocol {transport}\n"),
         )),
     }
 }
@@ -2757,22 +2640,14 @@ async fn open_tunnel(
     sid: String,
     target: &str,
 ) -> Result<(TunnelSender, TunnelReceiver)> {
-    let open = match &ctx.wire {
-        WireApi::V1 { .. } | WireApi::V2 { .. } => {
-            let open_url = format!(
-                "{}{}?s={}&r={}",
-                ctx.server,
-                ctx.wire.open_path(),
-                sid,
-                target
-            );
-            ctx.client.post(&open_url)
-        }
-        WireApi::Legacy => {
-            let open_url = format!("{}{}?s={}", ctx.server, ctx.wire.open_path(), sid);
-            ctx.client.post(&open_url).header("x-target", target)
-        }
-    };
+    let open_url = format!(
+        "{}{}?s={}&r={}",
+        ctx.server,
+        ctx.wire.open_path(),
+        sid,
+        target
+    );
+    let open = ctx.client.post(&open_url);
     let resp = if matches!(ctx.wire, WireApi::V2 { .. }) {
         let deadline = tokio::time::Instant::now() + ctx.retry_window;
         let mut attempt = 0;
@@ -2781,22 +2656,19 @@ async fn open_tunnel(
             if remaining.is_zero() {
                 bail!("v2 open retry window elapsed");
             }
-            match match &ctx.wire {
-                WireApi::V2 { .. } | WireApi::V1 { .. } => {
-                    ctx.client
-                        .post(format!(
-                            "{}{}?s={}&r={}",
-                            ctx.server,
-                            ctx.wire.open_path(),
-                            sid,
-                            target
-                        ))
-                        .timeout(ctx.timeout.min(remaining))
-                        .send()
-                        .await
-                }
-                WireApi::Legacy => unreachable!(),
-            } {
+            match ctx
+                .client
+                .post(format!(
+                    "{}{}?s={}&r={}",
+                    ctx.server,
+                    ctx.wire.open_path(),
+                    sid,
+                    target
+                ))
+                .timeout(ctx.timeout.min(remaining))
+                .send()
+                .await
+            {
                 Ok(response) if response.status().is_success() => break response,
                 Ok(response) if retryable_status(response.status()) => {
                     let delay = v2_backoff(attempt);
@@ -3360,26 +3232,27 @@ fn build_client(cfg: &ClientConfig) -> Result<reqwest::Client> {
         .danger_accept_invalid_certs(cfg.danger)
         .connect_timeout(cfg.timeout)
         .pool_max_idle_per_host(16);
-    if let WireApi::V1 { token } | WireApi::V2 { token } = &cfg.wire {
-        b = b.user_agent(V1_USER_AGENT);
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
-        headers.insert(
-            http::header::ACCEPT_LANGUAGE,
-            http::HeaderValue::from_static("en-US,en;q=0.9"),
-        );
-        headers.insert(
-            http::header::ACCEPT_ENCODING,
-            http::HeaderValue::from_static("gzip, deflate, br"),
-        );
-        if let Some(token) = token {
-            let mut value = http::HeaderValue::try_from(format!("Bearer {token}"))
-                .context("building Authorization header")?;
-            value.set_sensitive(true);
-            headers.insert(http::header::AUTHORIZATION, value);
-        }
-        b = b.default_headers(headers);
+    let token = match &cfg.wire {
+        WireApi::V1 { token } | WireApi::V2 { token } => token,
+    };
+    b = b.user_agent(V1_USER_AGENT);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
+    headers.insert(
+        http::header::ACCEPT_LANGUAGE,
+        http::HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    headers.insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static("gzip, deflate, br"),
+    );
+    if let Some(token) = token {
+        let mut value = http::HeaderValue::try_from(format!("Bearer {token}"))
+            .context("building Authorization header")?;
+        value.set_sensitive(true);
+        headers.insert(http::header::AUTHORIZATION, value);
     }
+    b = b.default_headers(headers);
     b = match &cfg.proxy {
         ProxyOpt::Env => b,
         ProxyOpt::Direct => b.no_proxy(),
@@ -3575,10 +3448,6 @@ pub async fn run_tcp_mapping_on(
     target: String,
     cfg: ClientConfig,
 ) -> Result<()> {
-    // In v1 `target` is an opaque route id resolved server-side, not a host:port.
-    if matches!(cfg.wire, WireApi::Legacy) {
-        validate_host_port(&target).map_err(|error| anyhow!(error))?;
-    }
     serve_tcp_mapping(listener, target, ctx_from(&cfg)?).await
 }
 
@@ -3602,20 +3471,10 @@ async fn serve_tcp_mapping(
     }
 }
 
-/// In v1 the mapping `target` is an opaque route id sent verbatim; in legacy it
-/// is a host:port that becomes a `<transport>://` X-Target.
-fn open_arg(ctx: &TunnelCtx, transport: Transport, target: &str) -> String {
-    match ctx.wire {
-        WireApi::V1 { .. } | WireApi::V2 { .. } => target.to_owned(),
-        WireApi::Legacy => format!("{}://{}", transport.as_str(), target),
-    }
-}
-
 async fn handle_tcp_connection(tcp: TcpStream, target: &str, ctx: Arc<TunnelCtx>) -> Result<()> {
     let sid = new_sid();
-    let open = open_arg(&ctx, Transport::Tcp, target);
-    log::debug!("TCP mapping -> {open} (session {sid})");
-    let (sender, receiver) = open_tunnel(ctx, sid, &open).await?;
+    log::debug!("TCP mapping -> {target} (session {sid})");
+    let (sender, receiver) = open_tunnel(ctx, sid, target).await?;
     bridge_tcp(tcp, sender, receiver).await;
     Ok(())
 }
@@ -3676,9 +3535,6 @@ pub async fn run_udp_mapping_on(
     target: String,
     cfg: ClientConfig,
 ) -> Result<()> {
-    if matches!(cfg.wire, WireApi::Legacy) {
-        validate_host_port(&target).map_err(|error| anyhow!(error))?;
-    }
     serve_udp_mapping(socket, target, ctx_from(&cfg)?).await
 }
 
@@ -3743,9 +3599,8 @@ async fn run_udp_peer(
     mut local_rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> Result<()> {
     let sid = new_sid();
-    let open = open_arg(&ctx, Transport::Udp, &target);
-    log::debug!("UDP mapping {source} -> {open} (session {sid})");
-    let (mut sender, mut receiver) = open_tunnel(ctx, sid, &open).await?;
+    log::debug!("UDP mapping {source} -> {target} (session {sid})");
+    let (mut sender, mut receiver) = open_tunnel(ctx, sid, &target).await?;
     let idle = tokio::time::sleep(SESSION_IDLE);
     tokio::pin!(idle);
     loop {
@@ -4667,7 +4522,7 @@ mod tests {
     #[test]
     fn empty_datagram_would_collide_with_keepalive() {
         // A zero-length payload framed as data ([0,0,0,0]) is byte-identical to
-        // a keepalive in the legacy/v1 framing. V2 has a kind byte and carries
+        // a keepalive in the v1 framing. V2 has a kind byte and carries
         // empty UDP datagrams without this ambiguity.
         assert_eq!(&encode_keepalive()[..], &[0u8, 0, 0, 0]);
         let mut dec = FrameDecoder::new();
@@ -4714,7 +4569,6 @@ mod tests {
             dashboard: None,
             auth_token: None,
             max_sessions: 1,
-            allow_legacy: false,
             routes: Arc::new(HashMap::new()),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4824,7 +4678,6 @@ mod tests {
             dashboard: Some(dashboard),
             auth_token: None,
             max_sessions: 1,
-            allow_legacy: false,
             routes: Arc::new(HashMap::new()),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4882,7 +4735,6 @@ mod tests {
             dashboard: Some(dashboard),
             auth_token: None,
             max_sessions: 1,
-            allow_legacy: false,
             routes: Arc::new(HashMap::new()),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

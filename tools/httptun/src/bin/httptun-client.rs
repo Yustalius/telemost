@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use httptun::{
-    run_mappings, selftest_ping, telemost_preset_maps, telemost_preset_maps_v1, throughput,
-    tls_probe, ClientConfig, Mode, PortMap, ProxyOpt, WireApi,
+    run_mappings, selftest_ping, telemost_preset_maps_v1, throughput, tls_probe, ClientConfig,
+    Mode, PortMap, ProxyOpt, WireApi,
 };
 
 /// Fixed local TCP/UDP listeners tunneled to an httptun-server over ordinary HTTP.
@@ -38,12 +38,8 @@ struct Args {
     #[arg(long = "danger-accept-invalid-cert")]
     danger: bool,
 
-    /// Compatibility alias for --wire-api legacy.
-    #[arg(long)]
-    legacy: bool,
-
-    /// Protocol API version. v2 is sequenced batch-only; v1 and legacy remain
-    /// available for migration.
+    /// Protocol API version. v2 is sequenced batch-only; v1 remains available
+    /// for migration.
     #[arg(long, value_enum)]
     wire_api: Option<WireChoice>,
 
@@ -103,7 +99,6 @@ struct Args {
 enum WireChoice {
     V2,
     V1,
-    Legacy,
 }
 
 #[tokio::main]
@@ -125,14 +120,7 @@ async fn main() -> anyhow::Result<()> {
             .map(server_url)
             .unwrap_or_else(|| "https://201.24.52.171:443".to_owned())
     });
-    if args.legacy && matches!(args.wire_api, Some(choice) if choice != WireChoice::Legacy) {
-        anyhow::bail!("--legacy conflicts with --wire-api");
-    }
-    let choice = if args.legacy {
-        WireChoice::Legacy
-    } else {
-        args.wire_api.unwrap_or(WireChoice::V2)
-    };
+    let choice = args.wire_api.unwrap_or(WireChoice::V2);
     let wire = match choice {
         WireChoice::V2 => WireApi::V2 {
             token: args.token.clone(),
@@ -140,7 +128,6 @@ async fn main() -> anyhow::Result<()> {
         WireChoice::V1 => WireApi::V1 {
             token: args.token.clone(),
         },
-        WireChoice::Legacy => WireApi::Legacy,
     };
     if matches!(wire, WireApi::V2 { .. }) && args.mode != Mode::Batch {
         anyhow::bail!("--wire-api v2 requires --mode batch");
@@ -165,12 +152,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let mut mappings = args.mappings;
         if args.telemost_preset.is_some() {
-            if matches!(choice, WireChoice::Legacy) {
-                let host = args.telemost_preset.as_deref().unwrap();
-                mappings.extend(telemost_preset_maps(host));
-            } else {
-                mappings.extend(telemost_preset_maps_v1());
-            }
+            mappings.extend(telemost_preset_maps_v1());
         }
         run_mappings(cfg, mappings).await
     }
@@ -192,4 +174,17 @@ fn httptun_init_log(verbose: u8) {
     };
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| format!("httptun={level}"));
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter)).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_is_default_and_removed_legacy_options_are_rejected() {
+        let args = Args::try_parse_from(["httptun-client"]).unwrap();
+        assert_eq!(args.wire_api.unwrap_or(WireChoice::V2), WireChoice::V2);
+        assert!(Args::try_parse_from(["httptun-client", "--wire-api", "legacy"]).is_err());
+        assert!(Args::try_parse_from(["httptun-client", "--legacy"]).is_err());
+    }
 }
