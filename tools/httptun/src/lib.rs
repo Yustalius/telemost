@@ -181,8 +181,8 @@ pub struct ServerConfig {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key paired with `tls_cert`.
     pub tls_key: Option<PathBuf>,
-    /// Shared bearer token required on every `/api/v1/*` request; `None` leaves
-    /// the v1 API unauthenticated (dev/tests only).
+    /// Shared bearer token required on every `/api/v1/*` and `/api/v2/*`
+    /// request; `None` leaves both APIs unauthenticated (dev/tests only).
     pub auth_token: Option<String>,
     /// Upper bound on concurrent sessions; opens past it are refused with 429.
     pub max_sessions: usize,
@@ -896,7 +896,7 @@ async fn handle(
     let path = req.uri().path().to_owned();
     log::debug!("--> {method} {path}");
 
-    // Every /api/v1/* request must carry the shared bearer token (when set).
+    // Every /api/v1/* and /api/v2/* request must carry the shared bearer token (when set).
     if (path == "/api/v1"
         || path.starts_with("/api/v1/")
         || path == "/api/v2"

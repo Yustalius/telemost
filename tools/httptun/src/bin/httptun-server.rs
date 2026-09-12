@@ -51,7 +51,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
 
-    /// Shared bearer token required on every /api/v1/* request.
+    /// Shared bearer token required on every /api/v1/* and /api/v2/* request.
     #[arg(long, value_name = "TOKEN")]
     auth_token: Option<String>,
 
