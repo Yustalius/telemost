@@ -11,9 +11,10 @@ Telemost -> TCP/UDP 127.0.0.1:2345x -> встроенный httptun client
 ```
 
 Внешний трафик туннеля идёт через bearer-protected `/api/v2/session/{open,send,recv,close}`.
-Встроенный режим - `v2` + `batch`; v2 Stream отклоняется. v1 и legacy
-`/o /u /d /c` сохранены только для совместимости. WebSocket и прямые внешние
-соединения Telemost к портам `2111x` не используются.
+Встроенный режим - `v2` + `batch`; v2 Stream отклоняется. Сервер поддерживает
+`/api/v1` и `/api/v2`, а V1 временно сохраняется для rollback-совместимости на одно
+релизное окно. Raw legacy удалён; точные `/o`, `/u`, `/d`, `/c` отвечают `404`.
+WebSocket и прямые внешние соединения Telemost к портам `2111x` не используются.
 
 ## Что запускается автоматически
 
@@ -104,8 +105,8 @@ loopback-портах `21115`, `21116`, `21117`.
 именем хоста, userinfo, query, fragment или непустым path сервер отвергает на
 старте. Без `--dashboard-backend` публичные маршруты, включая `/`, отвечают 404.
 
-`/api/v1` и вложенные пути, `/health`, а также точные legacy-пути `/o`, `/u`,
-`/d`, `/c` остаются маршрутам туннеля и не передаются dashboard. Proxy не
+`/api/v1`, `/api/v2` и вложенные пути, `/health`, а также точные `/o`, `/u`,
+`/d`, `/c` не передаются dashboard. Последние четыре всегда отвечают `404`. Proxy не
 поддерживает CONNECT и HTTP Upgrade. Он передаёт метод, path/query, тело и
 сквозные HTTP-заголовки, включая `Authorization`, cookies и `Host`; backend
 должен сам использовать `PUBLIC_ORIGIN` для публичных ссылок и редиректов.
@@ -137,12 +138,12 @@ journalctl -u httptun-server -f
 Nginx должен проксировать backend как `https://127.0.0.1:19443` (сервер не
 поддерживает plain HTTP), сохранять query string и `Authorization`, не делать
 upstream retries, отключать `proxy_request_buffering` и `proxy_buffering`, а
-таймауты задавать больше poll/retry window. Пути `/api/v1`, `/api/v2`, `/health`
-и разрешенные legacy пути должны оставаться зарезервированными и не попадать в
-dashboard upstream.
+таймауты задавать больше poll/retry window. Пути `/api/v1`, `/api/v2`, `/health`,
+а также точные `/o`, `/u`, `/d`, `/c` должны оставаться зарезервированными и не
+попадать в dashboard upstream; четыре raw legacy-пути должны отвечать `404`.
 
-должны появиться `/o`, `/u`, `/d` и target-ы `udp://127.0.0.1:21116` и
-`tcp://201.24.52.171:21117` при relay-подключении. В журнале hbbr
+В журнале туннеля должны появиться `/api/v2/session/...` и route ID `ru`/`rl`.
+В журнале hbbr
 (`journalctl -u rustdesk-hbbr`) должно быть `New relay request <uuid> from
 [::ffff:201.24.52.171]` — если источник loopback, hbbr закрывает соединение молча.
 
@@ -264,13 +265,11 @@ certbot renew --dry-run
   --auth-token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 \
   --relay-host 201.24.52.171 \
   --max-sessions 256 \
-  --allow-legacy \
   -v
 ```
 
-`--allow-legacy` оставляем только на время миграции (старый клиент ещё ходит на
-`/o /u /d /c` + `X-Target`). После выката пилотного клиента флаг убираем и
-рестартуем — legacy-пути начинают отдавать `404`.
+Сервер принимает только Wire V1/V2. Raw legacy нельзя включить флагом; `/o`, `/u`,
+`/d`, `/c` всегда отвечают `404`, даже при настроенном dashboard backend.
 
 ### Проверка
 
@@ -286,12 +285,13 @@ curl -4 -s -o /dev/null -w '%{http_code}\n' \
   -X POST 'https://ya-telemost.site/api/v1/session/open?s=x&r=bogus'
 ```
 
-Изолированная проверка транспорта клиентом (v2 batch — режим по умолчанию):
+Изолированная проверка транспорта клиентом (V2 batch — режим по умолчанию):
 
 ```bash
 target/release/httptun-client --telemost-preset ya-telemost.site \
   --token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 --mode batch -v
-# legacy (для сравнения / старого сервера):
-target/release/httptun-client --telemost-preset 201.24.52.171 \
-  --legacy --mode batch --no-proxy --danger-accept-invalid-cert -v
+
+# rollback-проверка Wire V1 той же dual-stack версии:
+target/release/httptun-client --telemost-preset ya-telemost.site \
+  --wire-api v1 --token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 --mode batch -v
 ```
