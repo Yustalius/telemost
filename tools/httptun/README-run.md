@@ -6,12 +6,13 @@ Desktop-сборка Telemost включает HTTP-туннель по умол
 
 ```text
 Telemost -> TCP/UDP 127.0.0.1:2345x -> встроенный httptun client
-         -> HTTPS batch, VPS:443 -> httptun-server
+         -> HTTPS batch, VPS:443 (Nginx) -> https://127.0.0.1:19443 httptun-server
          -> TCP/UDP 127.0.0.1:2111x -> hbbs/hbbr
 ```
 
-Внешний трафик туннеля идёт обычными HTTPS-запросами `POST /o`, `POST /u`,
-`GET /d`, `POST /c`. Встроенный режим - `batch`; WebSocket и прямые внешние
+Внешний трафик туннеля идёт через bearer-protected `/api/v2/session/{open,send,recv,close}`.
+Встроенный режим - `v2` + `batch`; v2 Stream отклоняется. v1 и legacy
+`/o /u /d /c` сохранены только для совместимости. WebSocket и прямые внешние
 соединения Telemost к портам `2111x` не используются.
 
 ## Что запускается автоматически
@@ -81,10 +82,11 @@ ssh root@201.24.52.171
 install -m 0755 /tmp/httptun-server.new /opt/httptun/httptun-server
 systemctl restart httptun-server
 systemctl --no-pager --full status httptun-server
-curl -k https://127.0.0.1/health
+curl -k https://127.0.0.1:19443/health
 ```
 
-Сервис должен запускать сервер на `0.0.0.0:443`; hbbs/hbbr должны быть доступны на
+Nginx владеет публичным `:443`; сервис запускает TLS-сервер только на
+`127.0.0.1:19443`. Клиенты по-прежнему используют публичный `https://host:443`.
 loopback-портах `21115`, `21116`, `21117`.
 
 ### Локальный dashboard за тем же HTTPS-адресом
@@ -94,7 +96,7 @@ loopback-портах `21115`, `21116`, `21117`.
 
 ```bash
 /opt/httptun/httptun-server \
-  --listen 0.0.0.0:443 \
+  --listen 127.0.0.1:19443 \
   --dashboard-backend http://127.0.0.1:8080
 ```
 
@@ -131,6 +133,13 @@ target/debug/telemost --get-id
 ```bash
 journalctl -u httptun-server -f
 ```
+
+Nginx должен проксировать backend как `https://127.0.0.1:19443` (сервер не
+поддерживает plain HTTP), сохранять query string и `Authorization`, не делать
+upstream retries, отключать `proxy_request_buffering` и `proxy_buffering`, а
+таймауты задавать больше poll/retry window. Пути `/api/v1`, `/api/v2`, `/health`
+и разрешенные legacy пути должны оставаться зарезервированными и не попадать в
+dashboard upstream.
 
 должны появиться `/o`, `/u`, `/d` и target-ы `udp://127.0.0.1:21116` и
 `tcp://201.24.52.171:21117` при relay-подключении. В журнале hbbr
@@ -180,7 +189,7 @@ target/release/httptun-client \
 
 target/release/httptun-client \
   --selftest-ping --server https://201.24.52.171:443 \
-  --mode stream --no-proxy --danger-accept-invalid-cert
+  --wire-api v1 --mode stream --no-proxy --danger-accept-invalid-cert
 ```
 
 `--map` также можно повторять вручную, например
@@ -214,12 +223,12 @@ target/debug/relay-probe --role ping --relay-server 201.24.52.171:21117 \
 
 `echo_ok:true` = связь клиент↔сервер через HTTP-batch работает end-to-end.
 
-## O1 — TLS-метаданные: домен, публичный серт, `/api/v1`, токен
+## O1 — TLS-метаданные: домен, публичный серт, `/api/v2`, токен
 
 Фаза O1 снимает самые громкие отпечатки туннеля: клиент ходит на реальный домен
 `ya-telemost.site` (A → `201.24.52.171`) с валидным SNI и публично доверенным
-сертификатом (проверка включена, `danger:false`), запросы идут под браузерными
-заголовками на пути `/api/v1/session/{open,send,recv,close}`, произвольный
+сертификатом (проверка включена, `danger:false`), запросы идут на
+`/api/v2/session/{open,send,recv,close}`, произвольный
 `X-Target` заменён четырьмя фиксированными route ID, а API защищён общим
 bearer-токеном и лимитом сессий.
 
@@ -249,7 +258,7 @@ certbot renew --dry-run
 
 ```bash
 /opt/httptun/httptun-server \
-  --listen 0.0.0.0:443 \
+  --listen 127.0.0.1:19443 \
   --tls-cert /etc/letsencrypt/live/ya-telemost.site/fullchain.pem \
   --tls-key  /etc/letsencrypt/live/ya-telemost.site/privkey.pem \
   --auth-token tm1_9f3c7a1e8b6d4052a1c9e7f20b834d56 \
@@ -277,7 +286,7 @@ curl -4 -s -o /dev/null -w '%{http_code}\n' \
   -X POST 'https://ya-telemost.site/api/v1/session/open?s=x&r=bogus'
 ```
 
-Изолированная проверка транспорта клиентом (v1 — режим по умолчанию):
+Изолированная проверка транспорта клиентом (v2 batch — режим по умолчанию):
 
 ```bash
 target/release/httptun-client --telemost-preset ya-telemost.site \

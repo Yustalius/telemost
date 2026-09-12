@@ -38,11 +38,16 @@ struct Args {
     #[arg(long = "danger-accept-invalid-cert")]
     danger: bool,
 
-    /// Speak the legacy /o /u /d /c + X-Target API instead of /api/v1/*.
+    /// Compatibility alias for --wire-api legacy.
     #[arg(long)]
     legacy: bool,
 
-    /// Shared bearer token for the /api/v1/* API.
+    /// Protocol API version. v2 is sequenced batch-only; v1 and legacy remain
+    /// available for migration.
+    #[arg(long, value_enum)]
+    wire_api: Option<WireChoice>,
+
+    /// Shared bearer token for the /api/v1/* and /api/v2/* APIs.
     #[arg(long)]
     token: Option<String>,
 
@@ -53,6 +58,10 @@ struct Args {
     /// Connect timeout / batch long-poll bound, seconds.
     #[arg(long, default_value_t = 30)]
     timeout_sec: u64,
+
+    /// Total retry window for one v2 send or receive operation, seconds.
+    #[arg(long, default_value_t = 60)]
+    retry_window_sec: u64,
 
     /// -v debug, -vv trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -90,6 +99,13 @@ struct Args {
     seconds: u64,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum WireChoice {
+    V2,
+    V1,
+    Legacy,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -109,13 +125,26 @@ async fn main() -> anyhow::Result<()> {
             .map(server_url)
             .unwrap_or_else(|| "https://201.24.52.171:443".to_owned())
     });
-    let wire = if args.legacy {
-        WireApi::Legacy
+    if args.legacy && matches!(args.wire_api, Some(choice) if choice != WireChoice::Legacy) {
+        anyhow::bail!("--legacy conflicts with --wire-api");
+    }
+    let choice = if args.legacy {
+        WireChoice::Legacy
     } else {
-        WireApi::V1 {
-            token: args.token.clone(),
-        }
+        args.wire_api.unwrap_or(WireChoice::V2)
     };
+    let wire = match choice {
+        WireChoice::V2 => WireApi::V2 {
+            token: args.token.clone(),
+        },
+        WireChoice::V1 => WireApi::V1 {
+            token: args.token.clone(),
+        },
+        WireChoice::Legacy => WireApi::Legacy,
+    };
+    if matches!(wire, WireApi::V2 { .. }) && args.mode != Mode::Batch {
+        anyhow::bail!("--wire-api v2 requires --mode batch");
+    }
     let cfg = ClientConfig {
         server,
         mode: args.mode,
@@ -123,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         danger: args.danger,
         keepalive: Duration::from_secs(args.keepalive_sec.max(1)),
         timeout: Duration::from_secs(args.timeout_sec.max(1)),
+        retry_window: Duration::from_secs(args.retry_window_sec.max(1)),
         wire,
     };
 
@@ -135,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let mut mappings = args.mappings;
         if args.telemost_preset.is_some() {
-            if args.legacy {
+            if matches!(choice, WireChoice::Legacy) {
                 let host = args.telemost_preset.as_deref().unwrap();
                 mappings.extend(telemost_preset_maps(host));
             } else {

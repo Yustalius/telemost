@@ -59,7 +59,8 @@ async fn start_inner() -> Result<()> {
         danger: false,
         keepalive: Duration::from_secs(15),
         timeout: Duration::from_secs(30),
-        wire: WireApi::V1 {
+        retry_window: Duration::from_secs(60),
+        wire: WireApi::V2 {
             token: Some(HTTP_TUNNEL_AUTH_TOKEN.to_owned()),
         },
     };
