@@ -322,6 +322,13 @@ async fn create_relay_connection_(
     ipv4: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
+    use hbb_common::config;
+
+    let relay_server = if config::is_http_tunnel_enabled() {
+        config::http_tunnel_relay_server()
+    } else {
+        relay_server
+    };
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
         CONNECT_TIMEOUT,

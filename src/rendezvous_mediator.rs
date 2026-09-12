@@ -841,7 +841,12 @@ impl RendezvousMediator {
 
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
         if config::is_http_tunnel_enabled() {
-            return config::http_tunnel_relay_server();
+            // This address is advertised to the peer, which may not use a tunnel.
+            return if provided_by_rendezvous_server.is_empty() {
+                crate::check_port(config::HTTP_TUNNEL_SERVER_HOST, config::RELAY_PORT)
+            } else {
+                provided_by_rendezvous_server
+            };
         }
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {
@@ -1018,5 +1023,41 @@ impl Drop for CheckIfResendPk {
             Config::set_key_confirmed(false);
             log::info!("Set key_confirmed to false due to pk changed, will resend register_pk");
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "http-tunnel",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_advertises_public_relay() {
+        struct RestoreTunnel(bool);
+        impl Drop for RestoreTunnel {
+            fn drop(&mut self) {
+                config::set_http_tunnel_enabled(self.0);
+            }
+        }
+        let _restore = RestoreTunnel(config::is_http_tunnel_enabled());
+        config::set_http_tunnel_enabled(true);
+        let host = config::http_tunnel_rendezvous_server();
+        let mediator = RendezvousMediator {
+            addr: TargetAddr::Ip(host.parse().unwrap()),
+            host,
+            host_prefix: String::new(),
+            keep_alive: 0,
+        };
+
+        for advertised in ["203.0.113.7:21117", "relay.example.com:21118"] {
+            assert_eq!(mediator.get_relay_server(advertised.to_owned()), advertised);
+        }
+        assert_eq!(
+            mediator.get_relay_server(String::new()),
+            format!("{}:21117", config::HTTP_TUNNEL_SERVER_HOST)
+        );
     }
 }
