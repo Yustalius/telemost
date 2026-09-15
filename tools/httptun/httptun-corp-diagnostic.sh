@@ -7,7 +7,10 @@ STATE_DIR="$HOME/.telemost-vpn"
 PID_FILE="$STATE_DIR/httptun-reverse.pid"
 CLIENT_LOG="$STATE_DIR/httptun-reverse.log"
 VPN_CLI="/opt/cisco/anyconnect/bin/vpn"
-PX_PORT=3128
+PX_PORT=3129
+PX_PID="$STATE_DIR/httptun-reverse-px.pid"
+CORP_NOPROXY="retest-agent.apps.yd-m6-kt66.vimpelcom.ru"
+UPSTREAM_PROXY="ms-mwgvpn.vimpelcom.ru:9090"
 VPS_HOST="201.24.52.171"
 VPS_SSH="root@$VPS_HOST"
 VPS_BIND_PORT=13129
@@ -27,12 +30,43 @@ http_code_ok() {
     esac
 }
 
+reverse_px_owned() {
+    local pid recorded_pid cmd
+    pid=$(lsof -nP -t -iTCP:"$PX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | head -1)
+    [ -n "$pid" ] && [ -f "$PX_PID" ] || return 1
+    recorded_pid=$(sed -n '1p' "$PX_PID")
+    [ "$pid" = "$recorded_pid" ] || return 1
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+    case "$cmd" in
+        *"/px"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--port=$PX_PORT"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--proxy=$UPSTREAM_PROXY"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--auth=NEGOTIATE"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--noproxy=$CORP_NOPROXY"*) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 printf '%s\n' '== Mac preflight =='
+vpn_connected=0
 if [ -x "$VPN_CLI" ]; then
     vpn_status=$("$VPN_CLI" status 2>/dev/null | grep -iE 'state:' | head -1)
     case "$vpn_status" in
         *[Dd]isconnected*) fail "Cisco VPN отключён" ;;
-        *[Cc]onnected*) ok "Cisco VPN подключён" ;;
+        *[Cc]onnected*) vpn_connected=1; ok "Cisco VPN подключён" ;;
         *) fail "состояние Cisco VPN не определено" ;;
     esac
 else
@@ -45,10 +79,10 @@ else
     fail "Kerberos-ticket отсутствует или истёк"
 fi
 
-if lsof -nP -iTCP:"$PX_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    ok "px слушает 127.0.0.1:$PX_PORT"
+if reverse_px_owned; then
+    ok "dedicated px слушает 127.0.0.1:$PX_PORT и принадлежит launcher"
 else
-    fail "px не слушает порт $PX_PORT"
+    fail "dedicated px:$PX_PORT отсутствует или не принадлежит launcher"
 fi
 
 client_running=0
@@ -76,28 +110,44 @@ else
     fail "launcher не найден: $LAUNCHER"
 fi
 
-printf '%s\n' '== Mac curl через px/MWG =='
+printf '%s\n' '== Mac routing через standalone reverse px =='
 vps_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 --noproxy '' \
     -x "http://127.0.0.1:$PX_PORT" "$SERVER_URL/health" 2>"$STATE_DIR/diagnostic-vps.err" || true)
 if [ "$vps_code" = 200 ]; then
-    ok "px -> MWG -> VPS /health = HTTP 200"
+    ok "dedicated px:$PX_PORT -> MWG -> VPS /health = HTTP 200"
 else
-    fail "px -> MWG -> VPS /health = HTTP ${vps_code:-000}"
+    fail "dedicated px:$PX_PORT -> MWG -> VPS /health = HTTP ${vps_code:-000}"
 fi
 
-corp_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 35 --noproxy '' \
-    -x "http://127.0.0.1:$PX_PORT" "$CORP_URL" 2>"$STATE_DIR/diagnostic-corp.err" || true)
-if http_code_ok "$corp_code"; then
-    ok "px -> корпоративный сайт = HTTP $corp_code"
+corp_direct=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+    curl -sS -o /dev/null -w '%{http_code}' --max-time 35 \
+    --proxy '' -H 'Connection: close' "$CORP_URL" 2>"$STATE_DIR/diagnostic-corp-direct.err" || true)
+if http_code_ok "$corp_direct"; then
+    ok "корпоративный сайт напрямую (без proxy) = HTTP $corp_direct"
 else
-    fail "px -> корпоративный сайт = HTTP ${corp_code:-000}"
+    fail "корпоративный сайт напрямую (без proxy) = HTTP ${corp_direct:-000}"
+fi
+
+if reverse_px_owned; then
+    corp_rv=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 35 --noproxy '' \
+        -x "http://127.0.0.1:$PX_PORT" "$CORP_URL" 2>"$STATE_DIR/diagnostic-corp.err" || true)
+    if http_code_ok "$corp_rv"; then
+        ok "dedicated px:$PX_PORT -> корпоративный сайт (noproxy, direct VPN) = HTTP $corp_rv"
+    else
+        fail "dedicated px:$PX_PORT -> корпоративный сайт = HTTP ${corp_rv:-000}"
+    fi
+else
+    warn "dedicated reverse px:$PX_PORT не принадлежит launcher — проверка corp через reverse пропущена"
 fi
 
 printf '%s\n' '== VPS reverse proxy load check =='
-if [ "$client_running" -ne 1 ]; then
+if [ "$vpn_connected" -ne 1 ]; then
+    warn "reverse load-check пропущен: Cisco VPN не подключён"
+elif [ "$client_running" -ne 1 ]; then
     warn "reverse load-check пропущен: сначала успешно запусти launcher"
 elif ! nc -G 8 -z "$VPS_HOST" 22 >/dev/null 2>&1; then
-    fail "VPS:22 недоступен; удалённые проверки не запускались"
+    warn "VPS:22 из-под VPN недоступен (ограничение сети); удалённые проверки пропущены"
 else
     ok "VPS:22 доступен"
     if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$VPS_SSH" bash -s -- \

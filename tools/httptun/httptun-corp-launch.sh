@@ -1,6 +1,14 @@
 #!/bin/bash
 # Start the reverse httptun client on a corporate Mac. The server-side port is
-# an HTTP proxy because the local target is px on 127.0.0.1:3128.
+# an HTTP proxy because the local target is px on the dedicated reverse port.
+#
+# The reverse launcher owns its own px on 127.0.0.1:3129. It is configured with
+# --noproxy for the corporate app domain so that:
+#   * httptun-api traffic to ya-telemost.site still flows through MWG (upstream
+#     proxy --proxy=ms-mwgvpn.vimpelcom.ru:9090, --auth=NEGOTIATE);
+#   * a connect to the corporate test app bypasses MWG and dials directly
+#     through the Cisco VPN (px --noproxy => direct connect).
+# No other local proxy is required or managed by this launcher.
 
 set -u
 
@@ -10,11 +18,13 @@ TOKEN_FILE="$STATE_DIR/httptun-token"
 OWNER_FILE="$STATE_DIR/reverse-owner-id"
 PID_FILE="$STATE_DIR/httptun-reverse.pid"
 HTTPTUN_LOG="$STATE_DIR/httptun-reverse.log"
-PX_LOG="$STATE_DIR/px.log"
 
 PX_BIN="$HOME/.local/bin/px"
-PX_PORT=3128
+PX_PORT=3129
+PX_PID="$STATE_DIR/httptun-reverse-px.pid"
+PX_LOG="$STATE_DIR/httptun-reverse-px.log"
 UPSTREAM_PROXY="ms-mwgvpn.vimpelcom.ru:9090"
+CORP_NOPROXY="retest-agent.apps.yd-m6-kt66.vimpelcom.ru"
 SERVER_URL="https://ya-telemost.site"
 ENDPOINT_ID="probe"
 VPS_SSH="root@201.24.52.171"
@@ -37,7 +47,7 @@ usage() {
         "Использование: $0 [start|--status|--stop|--diagnostic] [--force]" \
         "  start / без аргументов  проверить окружение и запустить reverse httptun" \
         "  --status              показать состояние px, клиента и VPS bind" \
-        "  --stop                остановить только httptun-client" \
+        "  --stop                остановить httptun-client и принадлежащий ему px" \
         "  --diagnostic          запустить с подробным логом" \
         "  --force               продолжить при неясном VPN/Kerberos или precheck"
 }
@@ -89,28 +99,102 @@ px_listening() {
     lsof -nP -iTCP:"$PX_PORT" -sTCP:LISTEN >/dev/null 2>&1
 }
 
+px_listener_pid() {
+    lsof -nP -t -iTCP:"$PX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | head -1
+}
+
+px_cmd_matches() {
+    local cmd
+    cmd=$(ps -p "$1" -o command= 2>/dev/null)
+    [ -n "$cmd" ] || return 1
+    case "$cmd" in
+        *"/px"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--port=$PX_PORT"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--proxy=$UPSTREAM_PROXY"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--auth=NEGOTIATE"*) ;;
+        *) return 1 ;;
+    esac
+    case "$cmd" in
+        *"--noproxy=$CORP_NOPROXY"*) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+px_owned() {
+    local pid recorded_pid
+    pid=$(px_listener_pid)
+    [ -n "$pid" ] && [ -f "$PX_PID" ] || return 1
+    recorded_pid=$(sed -n '1p' "$PX_PID")
+    [ "$pid" = "$recorded_pid" ] || return 1
+    px_cmd_matches "$pid"
+}
+
 ensure_px() {
     if px_listening; then
-        ok "px:$PX_PORT уже слушает"
+        px_owned || die "порт $PX_PORT занят чужим процессом (не с нашим px $UPSTREAM_PROXY/noproxy=$CORP_NOPROXY); не останавливаю его и не запускаю reverse"
+        ok "dedicated px:$PX_PORT уже слушает"
         return
     fi
     [ -x "$PX_BIN" ] || die "px не найден: $PX_BIN"
-    info "поднимаю px:$PX_PORT"
+    info "поднимаю dedicated px:$PX_PORT"
     if [ -n "$KRB5CCNAME_OVERRIDE" ]; then
-        KRB5CCNAME="$KRB5CCNAME_OVERRIDE" nohup "$PX_BIN" \
+        nohup env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+            -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+            KRB5CCNAME="$KRB5CCNAME_OVERRIDE" "$PX_BIN" \
             --proxy="$UPSTREAM_PROXY" --port="$PX_PORT" --auth=NEGOTIATE \
+            --noproxy="$CORP_NOPROXY" \
             >"$PX_LOG" 2>&1 &
     else
-        nohup "$PX_BIN" --proxy="$UPSTREAM_PROXY" --port="$PX_PORT" --auth=NEGOTIATE \
+        nohup env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+            -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+            "$PX_BIN" --proxy="$UPSTREAM_PROXY" --port="$PX_PORT" --auth=NEGOTIATE \
+            --noproxy="$CORP_NOPROXY" \
             >"$PX_LOG" 2>&1 &
     fi
+    local pid=$!
+    printf '%s\n' "$pid" >"$PX_PID"
     local attempt=0
     while ! px_listening && [ "$attempt" -lt 30 ]; do
         sleep 0.5
         attempt=$((attempt + 1))
     done
-    px_listening || die "px:$PX_PORT не поднялся; см. $PX_LOG"
-    ok "px:$PX_PORT слушает"
+    if ! px_owned; then
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PX_PID"
+        die "dedicated px:$PX_PORT не поднялся с ожидаемым PID; см. $PX_LOG"
+    fi
+    ok "dedicated px:$PX_PORT слушает"
+}
+
+stop_px() {
+    if ! px_listening; then
+        rm -f "$PX_PID"
+        return
+    fi
+    local pid
+    pid=$(px_listener_pid)
+    [ -n "$pid" ] || { rm -f "$PX_PID"; return; }
+    if px_owned; then
+        kill "$pid" 2>/dev/null || true
+        local attempt=0
+        while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+            sleep 0.25
+            attempt=$((attempt + 1))
+        done
+    else
+        warn "px:$PX_PORT не принадлежит launcher (PID=$pid); не останавливаю его"
+    fi
+    rm -f "$PX_PID"
 }
 
 client_pid() {
@@ -177,7 +261,12 @@ e2e_probe() {
 }
 
 do_status() {
-    px_listening && ok "px:$PX_PORT слушает" || warn "px:$PX_PORT не слушает"
+    if px_listening; then
+        px_owned && ok "dedicated px:$PX_PORT слушает (--noproxy=$CORP_NOPROXY)" \
+            || warn "порт $PX_PORT занят чужим процессом (не наш px)"
+    else
+        warn "dedicated px:$PX_PORT не слушает"
+    fi
     local pid
     if pid=$(client_pid); then
         ok "httptun-client запущен (pid $pid)"
@@ -198,7 +287,8 @@ case "$ACTION" in
         ;;
     stop)
         stop_client
-        ok "httptun-client остановлен; px оставлен запущенным"
+        stop_px
+        ok "httptun-client и его dedicated px:$PX_PORT остановлены"
         exit 0
         ;;
 esac
@@ -232,7 +322,11 @@ stop_client
 : >"$HTTPTUN_LOG"
 verbosity="-v"
 [ "$DIAGNOSTIC" -eq 1 ] && verbosity="-vv"
-info "запускаю reverse httptun"
+info "запускаю reverse httptun через dedicated px:$PX_PORT"
+# Explicit --proxy keeps httptun-api traffic (claim/accept for ya-telemost.site)
+# pinned to the dedicated px regardless of inherited HTTP_PROXY/ALL_PROXY.
+# The reverse target dial is a raw TCP connect to the same dedicated px on
+# 127.0.0.1:$PX_PORT; its --noproxy sends the corp app directly via the VPN.
 HTTPS_PROXY="http://127.0.0.1:$PX_PORT" \
 ALL_PROXY="http://127.0.0.1:$PX_PORT" \
 NO_PROXY="127.0.0.1,localhost" \
@@ -240,6 +334,7 @@ nohup "$HTTPTUN_BIN" \
     --server "$SERVER_URL" \
     --wire-api v2 \
     --mode batch \
+    --proxy "http://127.0.0.1:$PX_PORT" \
     --token-file "$TOKEN_FILE" \
     --reverse-owner-file "$OWNER_FILE" \
     --reverse-map "$ENDPOINT_ID->127.0.0.1:$PX_PORT" \

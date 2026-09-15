@@ -205,23 +205,36 @@ Reverse-режим запускается отдельным `httptun-client`; �
 httptun-server ... --reverse probe=127.0.0.1:13129
 ```
 
-На Mac HTTP-запросы клиента идут к VPS через proxy-env, а цель
-`127.0.0.1:3128` открывается локальным прямым TCP-соединением:
+Корпоративный трафик и трафик к VPS разделены: публичный `ya-telemost.site`
+доступен только через MWG (прокси), а внутренний сайт корпоративной сети — только
+напрямую через VPN (`--noproxy`). Поэтому reverse-launcher поднимает **собственный**
+px на `127.0.0.1:3129`: HTTP-запросы
+httptun-client к VPS идут через него с upstream `ms-mwgvpn.vimpelcom.ru:9090`, а
+CONNECT к корпоративному приложению обходит MWG через `--noproxy` и дилится
+напрямую через Cisco VPN. Другие локальные proxy-процессы для reverse не нужны
+и не влияют на него.
+
+Ручной запуск обратного канала (dedicated px:3129, `--noproxy` для корп-домена):
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:3128 \
-ALL_PROXY=http://127.0.0.1:3128 \
+$HOME/.local/bin/px --proxy=ms-mwgvpn.vimpelcom.ru:9090 --port=3129 \
+  --auth=NEGOTIATE --noproxy=retest-agent.apps.yd-m6-kt66.vimpelcom.ru &
+
+HTTPS_PROXY=http://127.0.0.1:3129 \
+ALL_PROXY=http://127.0.0.1:3129 \
 NO_PROXY=127.0.0.1,localhost \
 httptun-client --server https://ya-telemost.site \
   --wire-api v2 --mode batch --timeout-sec 30 \
+  --proxy http://127.0.0.1:3129 \
   --token-file ~/.telemost-vpn/httptun-token \
   --reverse-owner-file ~/.telemost-vpn/reverse-owner-id \
-  --reverse-map 'probe->127.0.0.1:3128'
+  --reverse-map 'probe->127.0.0.1:3129'
 ```
 
 Готовый launcher `tools/httptun/httptun-corp-launch.sh` также проверяет VPN,
 Kerberos и px, поддерживает `--status`, `--stop`, `--diagnostic` и выполняет
-необязательную сквозную проверку с VPS.
+необязательную сквозную проверку с VPS. `--stop` останавливает только процессы,
+созданные самим launcher (reverse client и его dedicated px:3129).
 
 После запуска канала `tools/httptun/httptun-corp-diagnostic.sh` проверяет Mac,
 делает curl через px/MWG и запускает с VPS 10 последовательных и 6 параллельных
