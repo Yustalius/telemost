@@ -233,8 +233,10 @@ httptun-client --server https://ya-telemost.site \
 
 Готовый launcher `tools/httptun/httptun-corp-launch.sh` также проверяет VPN,
 Kerberos и px, поддерживает `--status`, `--stop`, `--diagnostic` и выполняет
-необязательную сквозную проверку с VPS. `--stop` останавливает только процессы,
-созданные самим launcher (reverse client и его dedicated px:3129).
+локальные проверки без SSH к VPS. `--stop` останавливает только процессы,
+созданные самим launcher (reverse client и его dedicated px:3129). Сквозная
+проверка через VPS выполняется отдельным диагностическим скриптом, когда SSH:22
+доступен.
 
 После запуска канала `tools/httptun/httptun-corp-diagnostic.sh` проверяет Mac,
 делает curl через px/MWG и запускает с VPS 10 последовательных и 6 параллельных

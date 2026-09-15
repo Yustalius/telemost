@@ -27,8 +27,6 @@ UPSTREAM_PROXY="ms-mwgvpn.vimpelcom.ru:9090"
 CORP_NOPROXY="retest-agent.apps.yd-m6-kt66.vimpelcom.ru"
 SERVER_URL="https://ya-telemost.site"
 ENDPOINT_ID="probe"
-VPS_SSH="root@201.24.52.171"
-VPS_BIND_PORT=13129
 CORP_URL="https://retest-agent.apps.yd-m6-kt66.vimpelcom.ru/"
 VPN_CLI="/opt/cisco/anyconnect/bin/vpn"
 
@@ -241,25 +239,6 @@ probe_corp_target() {
     esac
 }
 
-vps_bind_up() {
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "$VPS_SSH" \
-        "ss -ltn | grep -q ':$VPS_BIND_PORT '" 2>/dev/null
-}
-
-e2e_probe() {
-    local code
-    code=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$VPS_SSH" \
-        "curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -x http://127.0.0.1:$VPS_BIND_PORT '$CORP_URL'" \
-        2>/dev/null) || {
-        warn "не удалось выполнить необязательную диагностику с VPS"
-        return
-    }
-    case "$code" in
-        2* | 3* | 401) ok "сквозной канал отвечает HTTP $code" ;;
-        *) warn "сквозная проверка вернула HTTP $code" ;;
-    esac
-}
-
 do_status() {
     if px_listening; then
         px_owned && ok "dedicated px:$PX_PORT слушает (--noproxy=$CORP_NOPROXY)" \
@@ -273,8 +252,6 @@ do_status() {
     else
         warn "httptun-client не запущен"
     fi
-    vps_bind_up && ok "VPS bind :$VPS_BIND_PORT открыт" || warn "VPS bind :$VPS_BIND_PORT недоступен"
-    [ -f "$HTTPTUN_LOG" ] && tail -n 5 "$HTTPTUN_LOG"
 }
 
 mkdir -p "$STATE_DIR" || die "не удалось создать $STATE_DIR"
@@ -354,6 +331,4 @@ done
 grep -q "reverse endpoint $ENDPOINT_ID claimed" "$HTTPTUN_LOG" || die "endpoint не claimed за 60 секунд"
 ok "reverse endpoint claimed"
 probe_corp_target
-vps_bind_up && ok "VPS bind :$VPS_BIND_PORT открыт" || warn "не удалось проверить VPS bind по SSH"
-e2e_probe
 say "Готово. Статус: $0 --status    Стоп: $0 --stop    Лог: $HTTPTUN_LOG"
