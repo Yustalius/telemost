@@ -14,8 +14,8 @@ use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
 use httptun::{
-    run_server_on, run_tcp_mapping_on, run_udp_mapping_on, ClientConfig, Mode, ProxyOpt, Route,
-    ServerConfig, Transport, WireApi,
+    run_reverse, run_server_on, run_tcp_mapping_on, run_udp_mapping_on, ClientConfig, Mode,
+    ProxyOpt, ReverseEndpointConfig, ReverseMap, Route, ServerConfig, Transport, WireApi,
 };
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -491,6 +491,7 @@ fn base_server_cfg(echo_all: bool) -> ServerConfig {
         auth_token: None,
         max_sessions: 256,
         routes: Vec::new(),
+        reverse: Vec::new(),
     }
 }
 
@@ -1885,4 +1886,201 @@ async fn v1_enforces_auth_route_and_limit() {
             "raw path {path} must stay removed"
         );
     }
+}
+
+async fn reserve_tcp_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+async fn claim_reverse_until_ready(
+    client: &reqwest::Client,
+    base: &str,
+    endpoint: &str,
+    owner: &str,
+    token: &str,
+) -> reqwest::Response {
+    let url = format!("{base}/api/v2/reverse/claim?ep={endpoint}&owner={owner}");
+    for _ in 0..100 {
+        if let Ok(response) = client.post(&url).bearer_auth(token).send().await {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("reverse claim did not become available")
+}
+
+async fn reverse_roundtrip(port: u16, payload: &'static [u8]) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(payload).await.unwrap();
+    let mut got = vec![0; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut got))
+        .await
+        .expect("reverse response timed out")
+        .unwrap();
+    assert_eq!(got, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_api_is_authenticated_cursor_safe_and_one_shot() {
+    let reverse_port = reserve_tcp_port().await;
+    let mut cfg = base_server_cfg(false);
+    cfg.auth_token = Some("reverse-secret".into());
+    cfg.reverse = vec![ReverseEndpointConfig {
+        id: "probe".into(),
+        bind: format!("127.0.0.1:{reverse_port}").parse().unwrap(),
+    }];
+    let server_port = spawn_server_with(cfg).await;
+    let base = format!("https://127.0.0.1:{server_port}");
+    let http = v2_http_client();
+
+    let response = http
+        .post(format!(
+            "{base}/api/v2/reverse/claim?ep=probe&owner=owner-one"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "13");
+
+    let response = http
+        .put(format!(
+            "{base}/api/v2/reverse/claim?ep=probe&owner=owner-one"
+        ))
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "19");
+    assert_eq!(response.headers().get("allow").unwrap(), "POST");
+
+    let response = http
+        .get(format!("{base}/api/v2/reverse/missing"))
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers().get("content-length").unwrap(), "10");
+
+    let response =
+        claim_reverse_until_ready(&http, &base, "probe", "owner-one", "reverse-secret").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "0");
+
+    let response =
+        claim_reverse_until_ready(&http, &base, "probe", "owner-two", "reverse-secret").await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let inbound = TcpStream::connect(("127.0.0.1", reverse_port))
+        .await
+        .unwrap();
+    let accept_url = format!("{base}/api/v2/reverse/accept?ep=probe&owner=owner-one&after=0");
+    let response = http
+        .get(&accept_url)
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("content-length"));
+    let first: serde_json::Value =
+        serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(first["cursor"], 1);
+    let conn_id = first["conns"][0]["id"].as_str().unwrap().to_owned();
+
+    let replay_response = http
+        .get(&accept_url)
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    let replay: serde_json::Value =
+        serde_json::from_slice(&replay_response.bytes().await.unwrap()).unwrap();
+    assert_eq!(replay["conns"][0]["id"], conn_id);
+
+    let route = format!("attach:probe:{conn_id}");
+    let response = http
+        .post(format!(
+            "{base}/api/v2/session/open?s=attached-one&r={route}&owner=owner-one"
+        ))
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = http
+        .post(format!(
+            "{base}/api/v2/session/open?s=attached-two&r={route}&owner=owner-one"
+        ))
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GONE);
+
+    let after_attach_response = http
+        .get(&accept_url)
+        .bearer_auth("reverse-secret")
+        .send()
+        .await
+        .unwrap();
+    let after_attach: serde_json::Value =
+        serde_json::from_slice(&after_attach_response.bytes().await.unwrap()).unwrap();
+    assert_eq!(after_attach["cursor"], 1);
+    assert_eq!(after_attach["conns"].as_array().unwrap().len(), 0);
+    drop(inbound);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_client_roundtrips_parallel_connections_and_reclaims_after_restart() {
+    let target = spawn_echo_target().await;
+    let reverse_port = reserve_tcp_port().await;
+    let mut server_cfg = base_server_cfg(false);
+    server_cfg.auth_token = Some("reverse-secret".into());
+    server_cfg.reverse = vec![ReverseEndpointConfig {
+        id: "probe".into(),
+        bind: format!("127.0.0.1:{reverse_port}").parse().unwrap(),
+    }];
+    let server_port = spawn_server_with(server_cfg).await;
+    let mut client_cfg = v2_client_config(server_port);
+    client_cfg.timeout = Duration::from_secs(25);
+    client_cfg.wire = WireApi::V2 {
+        token: Some("reverse-secret".into()),
+    };
+    let mapping = ReverseMap {
+        endpoint_id: "probe".into(),
+        dial_target: target.to_string(),
+    };
+    let owner = "persistent-owner".to_owned();
+
+    let first_client = tokio::spawn(run_reverse(
+        client_cfg.clone(),
+        vec![mapping.clone()],
+        owner.clone(),
+    ));
+    let http = v2_http_client();
+    let base = format!("https://127.0.0.1:{server_port}");
+    let response = claim_reverse_until_ready(&http, &base, "probe", &owner, "reverse-secret").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut rounds = Vec::new();
+    for _ in 0..16 {
+        rounds.push(tokio::spawn(reverse_roundtrip(reverse_port, b"parallel")));
+    }
+    for round in rounds {
+        round.await.unwrap();
+    }
+
+    first_client.abort();
+    let _ = first_client.await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_client = tokio::spawn(run_reverse(client_cfg, vec![mapping], owner.clone()));
+    let response = claim_reverse_until_ready(&http, &base, "probe", &owner, "reverse-secret").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    reverse_roundtrip(reverse_port, b"after-restart").await;
+    second_client.abort();
 }

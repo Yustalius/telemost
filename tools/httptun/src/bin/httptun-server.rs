@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use httptun::{run_server, telemost_preset_routes, Mode, ServerConfig};
+use httptun::{run_server, telemost_preset_routes, Mode, ReverseEndpointConfig, ServerConfig};
 
 /// HTTP-streaming tunnel server: bridges each fixed route to a TCP or UDP target
 /// or to a built-in echo responder.
@@ -55,6 +55,10 @@ struct Args {
     #[arg(long, value_name = "TOKEN")]
     auth_token: Option<String>,
 
+    /// Fixed reverse TCP listener, e.g. 'probe=127.0.0.1:13129' (repeatable).
+    #[arg(long, value_name = "ENDPOINT=LOOPBACK:PORT")]
+    reverse: Vec<ReverseEndpointConfig>,
+
     /// Maximum concurrent sessions before /api/v1/session/open returns 429.
     #[arg(long, default_value_t = 256)]
     max_sessions: usize,
@@ -94,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         auth_token: args.auth_token.clone(),
         max_sessions: args.max_sessions,
         routes: telemost_preset_routes(&args.relay_host),
+        reverse: args.reverse,
     };
     run_server(cfg).await
 }
@@ -115,5 +120,15 @@ mod tests {
     #[test]
     fn removed_legacy_option_is_rejected() {
         assert!(Args::try_parse_from(["httptun-server", "--allow-legacy"]).is_err());
+    }
+
+    #[test]
+    fn reverse_cli_accepts_only_loopback_bind() {
+        let args =
+            Args::try_parse_from(["httptun-server", "--reverse", "probe=127.0.0.1:13129"]).unwrap();
+        assert_eq!(args.reverse.len(), 1);
+        assert!(
+            Args::try_parse_from(["httptun-server", "--reverse", "probe=0.0.0.0:13129",]).is_err()
+        );
     }
 }

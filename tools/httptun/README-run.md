@@ -196,6 +196,38 @@ target/release/httptun-client \
 `--map` также можно повторять вручную, например
 `--map 'udp:23456->127.0.0.1:21116'`.
 
+## Reverse TCP для доступа через корпоративный Mac
+
+Reverse-режим запускается отдельным `httptun-client`; приложение Telemost для
+этого не требуется. Сервер принимает только заранее заданные loopback-bind'ы:
+
+```bash
+httptun-server ... --reverse probe=127.0.0.1:13129
+```
+
+На Mac HTTP-запросы клиента идут к VPS через proxy-env, а цель
+`127.0.0.1:3128` открывается локальным прямым TCP-соединением:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:3128 \
+ALL_PROXY=http://127.0.0.1:3128 \
+NO_PROXY=127.0.0.1,localhost \
+httptun-client --server https://ya-telemost.site \
+  --wire-api v2 --mode batch --timeout-sec 30 \
+  --token-file ~/.telemost-vpn/httptun-token \
+  --reverse-owner-file ~/.telemost-vpn/reverse-owner-id \
+  --reverse-map 'probe->127.0.0.1:3128'
+```
+
+Готовый launcher `tools/httptun/httptun-corp-launch.sh` также проверяет VPN,
+Kerberos и px, поддерживает `--status`, `--stop`, `--diagnostic` и выполняет
+необязательную сквозную проверку с VPS.
+
+Windows не запускает reverse-клиент. Скрипт
+`tools/httptun/windows-ssh-forward.ps1` проверяет доступность VPS:22 и держит
+SSH-проброс `127.0.0.1:13128 -> VPS 127.0.0.1:13129`; настройка браузера остаётся
+на стороне пользователя.
+
 ## relay-probe: headless-проверка relay-сессии через туннель
 
 `tools/relay-probe` — отдельный крейт, доказывающий, что настоящая relay-сессия

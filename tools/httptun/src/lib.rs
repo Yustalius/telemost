@@ -5,6 +5,8 @@
 //!     or UDP target (or a built-in `echo`), used on the VPS.
 //!   * [`run_mappings`] — fixed local TCP/UDP listeners that tunnel to configured
 //!     targets through ordinary POST/GET requests, honoring the system HTTP proxy.
+//!   * [`run_reverse`] — claims fixed server-side TCP listeners and bridges
+//!     accepted connections to local client-side targets.
 //!
 //! The wire framing inside the HTTP bodies is `[u32be len][payload]`, with
 //! `len == 0` a keepalive and `len == 0xFFFF_FFFF` a close marker. This keeps
@@ -48,6 +50,10 @@ const OPENING_IDLE: Duration = Duration::from_secs(60);
 const LOCAL_BIND_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DASHBOARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DASHBOARD_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+const REVERSE_ACCEPT_WAIT: Duration = Duration::from_secs(20);
+const REVERSE_PENDING_IDLE: Duration = Duration::from_secs(30);
+const REVERSE_OWNER_IDLE: Duration = Duration::from_secs(60);
+const REVERSE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 struct V2Counters {
     retries: AtomicU64,
@@ -166,6 +172,33 @@ pub struct Route {
     pub target: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseEndpointConfig {
+    pub id: String,
+    pub bind: SocketAddr,
+}
+
+impl FromStr for ReverseEndpointConfig {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (id, bind) = value
+            .split_once('=')
+            .ok_or_else(|| "expected <endpoint_id>=<loopback:port>".to_owned())?;
+        validate_reverse_id(id, "endpoint id")?;
+        let bind = bind
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("invalid reverse bind address {bind}"))?;
+        if !bind.ip().is_loopback() {
+            return Err("reverse bind address must be loopback".to_owned());
+        }
+        Ok(Self {
+            id: id.to_owned(),
+            bind,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -188,6 +221,9 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Fixed v1 routes the server will dial by id.
     pub routes: Vec<Route>,
+    /// Fixed loopback listeners whose accepted TCP sockets are attached by a
+    /// reverse client.
+    pub reverse: Vec<ReverseEndpointConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +259,43 @@ pub struct PortMap {
     pub transport: Transport,
     pub local_port: u16,
     pub target: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseMap {
+    pub endpoint_id: String,
+    pub dial_target: String,
+}
+
+impl FromStr for ReverseMap {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (endpoint_id, dial_target) = value
+            .split_once("->")
+            .ok_or_else(|| "expected <endpoint_id>-><host:port>".to_owned())?;
+        validate_reverse_id(endpoint_id, "endpoint id")?;
+        validate_host_port(dial_target)?;
+        Ok(Self {
+            endpoint_id: endpoint_id.to_owned(),
+            dial_target: dial_target.to_owned(),
+        })
+    }
+}
+
+fn validate_reverse_id(value: &str, label: &str) -> std::result::Result<(), String> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(format!("{label} must contain 1 to 128 characters"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "{label} may contain only ASCII letters, digits, '.', '_' and '-'"
+        ));
+    }
+    Ok(())
 }
 
 impl FromStr for PortMap {
@@ -579,6 +652,38 @@ fn octet_resp(body: Bytes) -> Response<BoxBody> {
     response
 }
 
+fn finite_resp(status: StatusCode, content_type: &'static str, body: Bytes) -> Response<BoxBody> {
+    let len = body.len() as u64;
+    let mut response = Response::new(full(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static(content_type),
+    );
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(len));
+    response
+}
+
+fn reverse_text_resp(status: StatusCode, msg: &str) -> Response<BoxBody> {
+    finite_resp(
+        status,
+        "text/plain; charset=utf-8",
+        Bytes::copy_from_slice(msg.as_bytes()),
+    )
+}
+
+fn reverse_json_resp<T: serde::Serialize>(value: &T) -> Response<BoxBody> {
+    match serde_json::to_vec(value) {
+        Ok(body) => finite_resp(StatusCode::OK, "application/json", Bytes::from(body)),
+        Err(error) => {
+            log::error!("serializing reverse response failed: {error}");
+            reverse_text_resp(StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -604,6 +709,57 @@ impl Session {
 type Registry = Arc<tokio::sync::Mutex<HashMap<String, Arc<Session>>>>;
 type V2Registry = Arc<tokio::sync::Mutex<HashMap<String, V2Entry>>>;
 type VersionClaims = Arc<tokio::sync::Mutex<HashMap<String, VersionClaim>>>;
+type ReverseRegistry = Arc<tokio::sync::Mutex<ReverseState>>;
+
+struct ReverseState {
+    endpoints: HashMap<String, ReverseEndpoint>,
+    pending: usize,
+    max_pending: usize,
+}
+
+struct ReverseEndpoint {
+    owner: Option<ReverseOwner>,
+    cursor: u64,
+    conns: HashMap<String, AcceptedReverseConn>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+struct ReverseOwner {
+    id: String,
+    last_seen: Instant,
+}
+
+struct AcceptedReverseConn {
+    stream: TcpStream,
+    peer: SocketAddr,
+    accepted_at: Instant,
+    owner: String,
+    cursor: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ReverseAttach {
+    endpoint_id: String,
+    conn_id: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ReverseAcceptConn {
+    id: String,
+    peer: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ReverseAcceptResponse {
+    conns: Vec<ReverseAcceptConn>,
+    cursor: u64,
+}
+
+enum ReverseAccess<T> {
+    Ready(T),
+    Unknown,
+    Conflict,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WireVersion {
@@ -675,6 +831,292 @@ struct DashboardBackend {
     progress_timeout: Duration,
 }
 
+async fn start_reverse_endpoints(
+    configs: &[ReverseEndpointConfig],
+    max_pending: usize,
+) -> Result<ReverseRegistry> {
+    let mut listeners = Vec::with_capacity(configs.len());
+    let mut endpoints = HashMap::with_capacity(configs.len());
+    for config in configs {
+        validate_reverse_id(&config.id, "endpoint id").map_err(anyhow::Error::msg)?;
+        if !config.bind.ip().is_loopback() {
+            bail!(
+                "reverse endpoint {} must bind a loopback address",
+                config.id
+            );
+        }
+        if endpoints.contains_key(&config.id) {
+            bail!("duplicate reverse endpoint {}", config.id);
+        }
+        let listener = TcpListener::bind(config.bind).await.with_context(|| {
+            format!("binding reverse endpoint {} on {}", config.id, config.bind)
+        })?;
+        endpoints.insert(
+            config.id.clone(),
+            ReverseEndpoint {
+                owner: None,
+                cursor: 0,
+                conns: HashMap::new(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        listeners.push((config.id.clone(), listener));
+    }
+    let registry = Arc::new(tokio::sync::Mutex::new(ReverseState {
+        endpoints,
+        pending: 0,
+        max_pending,
+    }));
+    for (endpoint_id, listener) in listeners {
+        let registry = registry.clone();
+        tokio::spawn(reverse_accept_loop(endpoint_id, listener, registry));
+    }
+    spawn_reverse_sweeper(registry.clone());
+    Ok(registry)
+}
+
+fn expire_reverse_endpoint(endpoint: &mut ReverseEndpoint, now: Instant) -> usize {
+    let before = endpoint.conns.len();
+    endpoint
+        .conns
+        .retain(|_, conn| now.duration_since(conn.accepted_at) <= REVERSE_PENDING_IDLE);
+    if endpoint
+        .owner
+        .as_ref()
+        .map(|owner| now.duration_since(owner.last_seen) > REVERSE_OWNER_IDLE)
+        .unwrap_or(false)
+    {
+        endpoint.owner = None;
+        endpoint.conns.clear();
+    }
+    before.saturating_sub(endpoint.conns.len())
+}
+
+async fn reverse_accept_loop(
+    endpoint_id: String,
+    listener: TcpListener,
+    registry: ReverseRegistry,
+) {
+    let local = listener.local_addr().ok();
+    log::info!("reverse endpoint {endpoint_id} listening on {local:?}");
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("reverse endpoint {endpoint_id} accept failed: {error}");
+                continue;
+            }
+        };
+        let now = Instant::now();
+        let mut state = registry.lock().await;
+        let removed = match state.endpoints.get_mut(&endpoint_id) {
+            Some(endpoint) => expire_reverse_endpoint(endpoint, now),
+            None => return,
+        };
+        state.pending = state.pending.saturating_sub(removed);
+        if state.pending >= state.max_pending {
+            log::warn!("reverse pending connection limit reached; dropping {peer}");
+            continue;
+        }
+        let inserted = if let Some(endpoint) = state.endpoints.get_mut(&endpoint_id) {
+            if let Some(owner) = endpoint.owner.as_ref() {
+                endpoint.cursor = endpoint.cursor.saturating_add(1);
+                let cursor = endpoint.cursor;
+                let conn_id = new_sid();
+                endpoint.conns.insert(
+                    conn_id.clone(),
+                    AcceptedReverseConn {
+                        stream,
+                        peer,
+                        accepted_at: now,
+                        owner: owner.id.clone(),
+                        cursor,
+                    },
+                );
+                log::debug!("reverse endpoint {endpoint_id} accepted {peer} as {conn_id}");
+                Some(endpoint.notify.clone())
+            } else {
+                None
+            }
+        } else {
+            return;
+        };
+        if let Some(notify) = inserted {
+            state.pending += 1;
+            drop(state);
+            notify.notify_one();
+        }
+    }
+}
+
+fn spawn_reverse_sweeper(registry: ReverseRegistry) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REVERSE_SWEEP_INTERVAL).await;
+            let now = Instant::now();
+            let mut state = registry.lock().await;
+            let removed = state
+                .endpoints
+                .values_mut()
+                .map(|endpoint| expire_reverse_endpoint(endpoint, now))
+                .sum::<usize>();
+            state.pending = state.pending.saturating_sub(removed);
+        }
+    });
+}
+
+async fn claim_reverse_endpoint(
+    registry: &ReverseRegistry,
+    endpoint_id: &str,
+    owner_id: &str,
+) -> ReverseAccess<()> {
+    let now = Instant::now();
+    let mut state = registry.lock().await;
+    let removed = match state.endpoints.get_mut(endpoint_id) {
+        Some(endpoint) => expire_reverse_endpoint(endpoint, now),
+        None => return ReverseAccess::Unknown,
+    };
+    state.pending = state.pending.saturating_sub(removed);
+    let endpoint = match state.endpoints.get_mut(endpoint_id) {
+        Some(endpoint) => endpoint,
+        None => return ReverseAccess::Unknown,
+    };
+    match endpoint.owner.as_mut() {
+        Some(owner) if owner.id == owner_id => {
+            owner.last_seen = now;
+            ReverseAccess::Ready(())
+        }
+        Some(_) => ReverseAccess::Conflict,
+        None => {
+            endpoint.owner = Some(ReverseOwner {
+                id: owner_id.to_owned(),
+                last_seen: now,
+            });
+            ReverseAccess::Ready(())
+        }
+    }
+}
+
+async fn reverse_snapshot(
+    registry: &ReverseRegistry,
+    endpoint_id: &str,
+    owner_id: &str,
+    after: u64,
+) -> ReverseAccess<(ReverseAcceptResponse, bool)> {
+    let now = Instant::now();
+    let mut state = registry.lock().await;
+    let removed = match state.endpoints.get_mut(endpoint_id) {
+        Some(endpoint) => expire_reverse_endpoint(endpoint, now),
+        None => return ReverseAccess::Unknown,
+    };
+    state.pending = state.pending.saturating_sub(removed);
+    let endpoint = match state.endpoints.get_mut(endpoint_id) {
+        Some(endpoint) => endpoint,
+        None => return ReverseAccess::Unknown,
+    };
+    match endpoint.owner.as_mut() {
+        Some(owner) if owner.id == owner_id => owner.last_seen = now,
+        _ => return ReverseAccess::Conflict,
+    }
+    let mut conns = endpoint
+        .conns
+        .iter()
+        .filter(|(_, conn)| conn.owner == owner_id && conn.cursor > after)
+        .map(|(id, conn)| {
+            (
+                conn.cursor,
+                ReverseAcceptConn {
+                    id: id.clone(),
+                    peer: conn.peer.to_string(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    conns.sort_by_key(|(cursor, _)| *cursor);
+    let ready = endpoint.cursor > after;
+    ReverseAccess::Ready((
+        ReverseAcceptResponse {
+            conns: conns.into_iter().map(|(_, conn)| conn).collect(),
+            cursor: endpoint.cursor,
+        },
+        ready,
+    ))
+}
+
+async fn take_reverse_conn(
+    registry: &ReverseRegistry,
+    attach: &ReverseAttach,
+    owner_id: &str,
+) -> ReverseAccess<Option<TcpStream>> {
+    let now = Instant::now();
+    let mut state = registry.lock().await;
+    let removed = match state.endpoints.get_mut(&attach.endpoint_id) {
+        Some(endpoint) => expire_reverse_endpoint(endpoint, now),
+        None => return ReverseAccess::Unknown,
+    };
+    state.pending = state.pending.saturating_sub(removed);
+    let endpoint = match state.endpoints.get_mut(&attach.endpoint_id) {
+        Some(endpoint) => endpoint,
+        None => return ReverseAccess::Unknown,
+    };
+    match endpoint.owner.as_mut() {
+        Some(owner) if owner.id == owner_id => owner.last_seen = now,
+        _ => return ReverseAccess::Conflict,
+    }
+    let stream = endpoint.conns.remove(&attach.conn_id).and_then(|conn| {
+        if conn.owner == owner_id {
+            Some(conn.stream)
+        } else {
+            None
+        }
+    });
+    if stream.is_some() {
+        state.pending = state.pending.saturating_sub(1);
+    }
+    ReverseAccess::Ready(stream)
+}
+
+async fn verify_reverse_owner(
+    registry: &ReverseRegistry,
+    endpoint_id: &str,
+    owner_id: &str,
+) -> ReverseAccess<()> {
+    let now = Instant::now();
+    let mut state = registry.lock().await;
+    let removed = match state.endpoints.get_mut(endpoint_id) {
+        Some(endpoint) => expire_reverse_endpoint(endpoint, now),
+        None => return ReverseAccess::Unknown,
+    };
+    state.pending = state.pending.saturating_sub(removed);
+    match state
+        .endpoints
+        .get(endpoint_id)
+        .and_then(|endpoint| endpoint.owner.as_ref())
+    {
+        Some(owner) if owner.id == owner_id => ReverseAccess::Ready(()),
+        _ => ReverseAccess::Conflict,
+    }
+}
+
+fn parse_reverse_attach(route: &str) -> std::result::Result<Option<ReverseAttach>, ()> {
+    let Some(rest) = route.strip_prefix("attach:") else {
+        return Ok(None);
+    };
+    let mut parts = rest.split(':');
+    let endpoint_id = parts.next().filter(|value| !value.is_empty()).ok_or(())?;
+    let conn_id = parts.next().filter(|value| !value.is_empty()).ok_or(())?;
+    if parts.next().is_some()
+        || validate_reverse_id(endpoint_id, "endpoint id").is_err()
+        || validate_reverse_id(conn_id, "connection id").is_err()
+    {
+        return Err(());
+    }
+    Ok(Some(ReverseAttach {
+        endpoint_id: endpoint_id.to_owned(),
+        conn_id: conn_id.to_owned(),
+    }))
+}
+
 pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -688,6 +1130,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
     let tls = build_server_tls(&cfg).context("building TLS config")?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let local = listener.local_addr().ok();
+    let reverse = start_reverse_endpoints(&cfg.reverse, cfg.max_sessions.max(1)).await?;
 
     let routes: HashMap<String, Route> = cfg
         .routes
@@ -722,13 +1165,14 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
     spawn_claim_sweeper(opts.claims.clone());
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, max_sessions={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, reverse={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
         cfg.echo_all,
         opts.auth_token.is_some(),
         opts.dashboard.is_some(),
         opts.routes.len(),
+        cfg.reverse.len(),
         opts.max_sessions,
     );
 
@@ -743,6 +1187,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         let acceptor = acceptor.clone();
         let reg = reg.clone();
         let v2reg = v2reg.clone();
+        let reverse = reverse.clone();
         let opts = opts.clone();
         tokio::spawn(async move {
             let tls = match acceptor.accept(tcp).await {
@@ -754,8 +1199,16 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
             };
             let io = TokioIo::new(tls);
             let v2reg = v2reg.clone();
-            let service =
-                service_fn(move |req| handle(req, reg.clone(), v2reg.clone(), opts.clone()));
+            let reverse = reverse.clone();
+            let service = service_fn(move |req| {
+                handle(
+                    req,
+                    reg.clone(),
+                    v2reg.clone(),
+                    reverse.clone(),
+                    opts.clone(),
+                )
+            });
             if let Err(e) = http1::Builder::new()
                 .keep_alive(true)
                 .serve_connection(io, service)
@@ -890,6 +1343,7 @@ async fn handle(
     req: Request<Incoming>,
     reg: Registry,
     v2reg: V2Registry,
+    reverse: ReverseRegistry,
     opts: ServerOpts,
 ) -> Result<Response<BoxBody>, Infallible> {
     let method = req.method().clone();
@@ -903,7 +1357,11 @@ async fn handle(
         || path.starts_with("/api/v2/"))
         && !authorized(&req, &opts)
     {
-        let resp = text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n");
+        let resp = if path == "/api/v2/reverse" || path.starts_with("/api/v2/reverse/") {
+            reverse_text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n")
+        } else {
+            text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n")
+        };
         log::debug!("<-- {method} {path} {}", resp.status());
         return Ok(resp);
     }
@@ -911,15 +1369,26 @@ async fn handle(
     let resp = if path == "/api/v2" || path.starts_with("/api/v2/") {
         match (&method, path.as_str()) {
             (&Method::POST, "/api/v2/session/open") => {
-                handle_open_v2(req, &v2reg, &reg, &opts).await
+                handle_open_v2(req, &v2reg, &reg, &reverse, &opts).await
             }
             (&Method::POST, "/api/v2/session/send") => handle_up_v2(req, &v2reg).await,
             (&Method::GET, "/api/v2/session/recv") => handle_down_v2(req, &v2reg).await,
             (&Method::POST, "/api/v2/session/close") => handle_close_v2(req, &v2reg, &opts).await,
+            (&Method::POST, "/api/v2/reverse/claim") => handle_reverse_claim(req, &reverse).await,
+            (&Method::GET, "/api/v2/reverse/accept") => handle_reverse_accept(req, &reverse).await,
             (_, "/api/v2/session/open") => method_not_allowed("POST", method == Method::HEAD),
             (_, "/api/v2/session/send") => method_not_allowed("POST", method == Method::HEAD),
             (_, "/api/v2/session/recv") => method_not_allowed("GET", method == Method::HEAD),
             (_, "/api/v2/session/close") => method_not_allowed("POST", method == Method::HEAD),
+            (_, "/api/v2/reverse/claim") => {
+                reverse_method_not_allowed("POST", method == Method::HEAD)
+            }
+            (_, "/api/v2/reverse/accept") => {
+                reverse_method_not_allowed("GET", method == Method::HEAD)
+            }
+            (_, path) if path == "/api/v2/reverse" || path.starts_with("/api/v2/reverse/") => {
+                reverse_text_resp(StatusCode::NOT_FOUND, "not found\n")
+            }
             _ => neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD),
         }
     } else if path == "/api/v1" || path.starts_with("/api/v1/") {
@@ -984,6 +1453,90 @@ fn method_not_allowed(allow: &'static str, head: bool) -> Response<BoxBody> {
         .headers_mut()
         .insert(http::header::ALLOW, http::HeaderValue::from_static(allow));
     response
+}
+
+fn reverse_method_not_allowed(allow: &'static str, head: bool) -> Response<BoxBody> {
+    let mut response = if head {
+        finite_resp(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain; charset=utf-8",
+            Bytes::new(),
+        )
+    } else {
+        reverse_text_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n")
+    };
+    response
+        .headers_mut()
+        .insert(http::header::ALLOW, http::HeaderValue::from_static(allow));
+    response
+}
+
+fn reverse_params(req: &Request<Incoming>) -> Option<(String, String)> {
+    let endpoint_id = query_param(req.uri(), "ep")
+        .filter(|value| validate_reverse_id(value, "endpoint id").is_ok())?;
+    let owner_id = query_param(req.uri(), "owner")
+        .filter(|value| validate_reverse_id(value, "owner id").is_ok())?;
+    Some((endpoint_id, owner_id))
+}
+
+async fn handle_reverse_claim(
+    req: Request<Incoming>,
+    registry: &ReverseRegistry,
+) -> Response<BoxBody> {
+    let (endpoint_id, owner_id) = match reverse_params(&req) {
+        Some(value) => value,
+        None => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid reverse parameters\n"),
+    };
+    match claim_reverse_endpoint(registry, &endpoint_id, &owner_id).await {
+        ReverseAccess::Ready(()) => reverse_text_resp(StatusCode::OK, ""),
+        ReverseAccess::Unknown => reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n"),
+        ReverseAccess::Conflict => {
+            reverse_text_resp(StatusCode::CONFLICT, "endpoint owned by another client\n")
+        }
+    }
+}
+
+async fn handle_reverse_accept(
+    req: Request<Incoming>,
+    registry: &ReverseRegistry,
+) -> Response<BoxBody> {
+    let (endpoint_id, owner_id) = match reverse_params(&req) {
+        Some(value) => value,
+        None => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid reverse parameters\n"),
+    };
+    let after = match query_param(req.uri(), "after").and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid cursor\n"),
+    };
+    let notify = {
+        let state = registry.lock().await;
+        match state.endpoints.get(&endpoint_id) {
+            Some(endpoint) => endpoint.notify.clone(),
+            None => return reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n"),
+        }
+    };
+    let deadline = tokio::time::Instant::now() + REVERSE_ACCEPT_WAIT;
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let (response, ready) =
+            match reverse_snapshot(registry, &endpoint_id, &owner_id, after).await {
+                ReverseAccess::Ready(value) => value,
+                ReverseAccess::Unknown => {
+                    return reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n")
+                }
+                ReverseAccess::Conflict => {
+                    return reverse_text_resp(StatusCode::CONFLICT, "endpoint not owned\n")
+                }
+            };
+        if ready || tokio::time::Instant::now() >= deadline {
+            return reverse_json_resp(&response);
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return reverse_json_resp(&response);
+        }
+    }
 }
 
 enum DashboardError {
@@ -1823,6 +2376,7 @@ async fn handle_open_v2(
     req: Request<Incoming>,
     reg: &V2Registry,
     _v1reg: &Registry,
+    reverse: &ReverseRegistry,
     opts: &ServerOpts,
 ) -> Response<BoxBody> {
     let sid = match query_param(req.uri(), "s").filter(|s| !s.is_empty()) {
@@ -1833,8 +2387,33 @@ async fn handle_open_v2(
         Some(r) => r,
         None => return text_resp(StatusCode::BAD_REQUEST, "missing route\n"),
     };
-    if resolve_route(&route, opts).is_none() {
-        return text_resp(StatusCode::BAD_REQUEST, "unknown route\n");
+    let attach = match parse_reverse_attach(&route) {
+        Ok(value) => value,
+        Err(()) => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid attach route\n"),
+    };
+    let reverse_owner = if attach.is_some() {
+        match query_param(req.uri(), "owner")
+            .filter(|value| validate_reverse_id(value, "owner id").is_ok())
+        {
+            Some(value) => Some(value),
+            None => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid owner id\n"),
+        }
+    } else {
+        if resolve_route(&route, opts).is_none() {
+            return text_resp(StatusCode::BAD_REQUEST, "unknown route\n");
+        }
+        None
+    };
+    if let (Some(attach), Some(owner_id)) = (&attach, &reverse_owner) {
+        match verify_reverse_owner(reverse, &attach.endpoint_id, owner_id).await {
+            ReverseAccess::Ready(()) => {}
+            ReverseAccess::Unknown => {
+                return reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n")
+            }
+            ReverseAccess::Conflict => {
+                return reverse_text_resp(StatusCode::CONFLICT, "endpoint not owned\n")
+            }
+        }
     }
     let (generation, permit) = match reserve_open(opts, &sid, &route, WireVersion::V2, false).await
     {
@@ -1852,6 +2431,36 @@ async fn handle_open_v2(
             admission,
         } => (generation, admission),
     };
+    if let (Some(attach), Some(owner_id)) = (attach, reverse_owner) {
+        let stream = match take_reverse_conn(reverse, &attach, &owner_id).await {
+            ReverseAccess::Ready(Some(stream)) => stream,
+            ReverseAccess::Ready(None) => {
+                release_claim_if_matches(opts, &sid, WireVersion::V2, generation).await;
+                return reverse_text_resp(StatusCode::GONE, "connection unavailable\n");
+            }
+            ReverseAccess::Unknown => {
+                release_claim_if_matches(opts, &sid, WireVersion::V2, generation).await;
+                return reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n");
+            }
+            ReverseAccess::Conflict => {
+                release_claim_if_matches(opts, &sid, WireVersion::V2, generation).await;
+                return reverse_text_resp(StatusCode::CONFLICT, "endpoint not owned\n");
+            }
+        };
+        let tx = create_v2_actor_from_tcp(stream, permit, opts.poll_wait);
+        reg.lock().await.insert(
+            sid.clone(),
+            V2Entry::Ready {
+                route,
+                generation,
+                tx,
+                up_inflight: Arc::new(std::sync::Mutex::new(None)),
+                last: Arc::new(std::sync::Mutex::new(Instant::now())),
+            },
+        );
+        complete_claim(opts, &sid, WireVersion::V2, generation, true).await;
+        return reverse_text_resp(StatusCode::OK, "");
+    }
     let existing = {
         let mut guard = reg.lock().await;
         if let Some(entry) = guard.get(&sid) {
@@ -2195,6 +2804,57 @@ async fn create_v2_actor(
         opts.poll_wait,
     ));
     Ok(tx)
+}
+
+fn create_v2_actor_from_tcp(
+    stream: TcpStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    poll_wait: Duration,
+) -> tokio::sync::mpsc::Sender<V2Command> {
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(CHAN_CAP);
+    let (mut rd, wr) = stream.into_split();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    let _ = events_tx.send(V2Event::Eof).await;
+                    break;
+                }
+                Ok(n) => {
+                    if events_tx
+                        .send(V2Event::Data(Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let (tx, rx) = tokio::sync::mpsc::channel(CHAN_CAP);
+    tokio::spawn(run_v2_actor(
+        V2Actor {
+            writer: V2Writer::Tcp(wr),
+            events: events_rx,
+            _event_keepalive: None,
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            expected_up: 0,
+            expected_down: 0,
+            last_up: None,
+            cached_down: None,
+            pending: None,
+            upstream_closed: false,
+            eof: false,
+            terminal: false,
+            _admission: permit,
+        },
+        rx,
+        poll_wait,
+    ));
+    tx
 }
 
 async fn run_v2_actor(
@@ -2640,12 +3300,25 @@ async fn open_tunnel(
     sid: String,
     target: &str,
 ) -> Result<(TunnelSender, TunnelReceiver)> {
+    open_tunnel_with_owner(ctx, sid, target, None).await
+}
+
+async fn open_tunnel_with_owner(
+    ctx: Arc<TunnelCtx>,
+    sid: String,
+    target: &str,
+    owner_id: Option<&str>,
+) -> Result<(TunnelSender, TunnelReceiver)> {
+    let owner_query = owner_id
+        .map(|owner| format!("&owner={owner}"))
+        .unwrap_or_default();
     let open_url = format!(
-        "{}{}?s={}&r={}",
+        "{}{}?s={}&r={}{}",
         ctx.server,
         ctx.wire.open_path(),
         sid,
-        target
+        target,
+        owner_query,
     );
     let open = ctx.client.post(&open_url);
     let resp = if matches!(ctx.wire, WireApi::V2 { .. }) {
@@ -2658,13 +3331,7 @@ async fn open_tunnel(
             }
             match ctx
                 .client
-                .post(format!(
-                    "{}{}?s={}&r={}",
-                    ctx.server,
-                    ctx.wire.open_path(),
-                    sid,
-                    target
-                ))
+                .post(&open_url)
                 .timeout(ctx.timeout.min(remaining))
                 .send()
                 .await
@@ -3278,6 +3945,240 @@ fn ctx_from(cfg: &ClientConfig) -> Result<Arc<TunnelCtx>> {
         retry_window: cfg.retry_window,
         wire: cfg.wire.clone(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Client: reverse TCP endpoints
+// ---------------------------------------------------------------------------
+
+pub async fn run_reverse(
+    cfg: ClientConfig,
+    mappings: Vec<ReverseMap>,
+    owner_id: String,
+) -> Result<()> {
+    if !matches!(cfg.wire, WireApi::V2 { .. }) || cfg.mode != Mode::Batch {
+        bail!("reverse mode requires wire api v2 and batch mode");
+    }
+    if cfg.timeout <= REVERSE_ACCEPT_WAIT {
+        bail!("reverse mode requires --timeout-sec greater than 20");
+    }
+    validate_reverse_id(&owner_id, "owner id").map_err(anyhow::Error::msg)?;
+    if mappings.is_empty() {
+        bail!("no reverse mappings configured; pass --reverse-map");
+    }
+    for (index, mapping) in mappings.iter().enumerate() {
+        validate_reverse_id(&mapping.endpoint_id, "endpoint id").map_err(anyhow::Error::msg)?;
+        validate_host_port(&mapping.dial_target).map_err(anyhow::Error::msg)?;
+        if mappings[..index]
+            .iter()
+            .any(|other| other.endpoint_id == mapping.endpoint_id)
+        {
+            bail!("duplicate reverse endpoint {}", mapping.endpoint_id);
+        }
+    }
+    let ctx = ctx_from(&cfg)?;
+    log::info!(
+        "httptun reverse client -> {} (proxy={:?}, endpoints={})",
+        ctx.server,
+        cfg.proxy,
+        mappings.len()
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for mapping in mappings {
+        tasks.spawn(serve_reverse_endpoint(
+            ctx.clone(),
+            mapping,
+            owner_id.clone(),
+        ));
+    }
+    match tasks.join_next().await {
+        Some(Ok(Ok(()))) => bail!("reverse endpoint stopped unexpectedly"),
+        Some(Ok(Err(error))) => Err(error),
+        Some(Err(error)) => Err(anyhow!("reverse endpoint task failed: {error}")),
+        None => bail!("no reverse endpoint tasks started"),
+    }
+}
+
+async fn collect_reverse_response(resp: reqwest::Response) -> Result<Bytes> {
+    let expected = resp
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| anyhow!("reverse response is missing Content-Length"))?;
+    if expected > MAX_BATCH {
+        bail!("reverse response exceeds batch limit");
+    }
+    let bytes = resp.bytes().await.context("reading reverse response")?;
+    if bytes.len() != expected {
+        bail!("reverse response body was truncated");
+    }
+    Ok(bytes)
+}
+
+fn reverse_response_error_is_terminal(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("missing Content-Length") || message.contains("exceeds batch limit")
+}
+
+async fn claim_reverse(ctx: &TunnelCtx, endpoint_id: &str, owner_id: &str) -> Result<()> {
+    let url = format!(
+        "{}/api/v2/reverse/claim?ep={endpoint_id}&owner={owner_id}",
+        ctx.server
+    );
+    let mut attempt = 0;
+    loop {
+        let result = ctx.client.post(&url).timeout(ctx.timeout).send().await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                match collect_reverse_response(response).await {
+                    Ok(body) if body.is_empty() => return Ok(()),
+                    Ok(_) => bail!("reverse claim returned an unexpected body"),
+                    Err(error) if reverse_response_error_is_terminal(&error) => return Err(error),
+                    Err(error) => {
+                        log::debug!("reverse endpoint {endpoint_id} claim response failed: {error}")
+                    }
+                }
+            }
+            Ok(response)
+                if response.status() == StatusCode::CONFLICT
+                    || retryable_status(response.status()) =>
+            {
+                log::debug!(
+                    "reverse endpoint {endpoint_id} claim status {}",
+                    response.status()
+                );
+            }
+            Ok(response) => {
+                bail!(
+                    "server refused reverse endpoint {endpoint_id}: {}",
+                    response.status()
+                )
+            }
+            Err(error) => log::debug!("reverse endpoint {endpoint_id} claim failed: {error}"),
+        }
+        tokio::time::sleep(v2_backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+enum ReversePoll {
+    Accepted(ReverseAcceptResponse),
+    Reclaim,
+}
+
+async fn poll_reverse(
+    ctx: &TunnelCtx,
+    endpoint_id: &str,
+    owner_id: &str,
+    after: u64,
+) -> Result<ReversePoll> {
+    let url = format!(
+        "{}/api/v2/reverse/accept?ep={endpoint_id}&owner={owner_id}&after={after}",
+        ctx.server
+    );
+    let mut attempt = 0;
+    loop {
+        let result = ctx.client.get(&url).timeout(ctx.timeout).send().await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                let body = match collect_reverse_response(response).await {
+                    Ok(body) => body,
+                    Err(error) if reverse_response_error_is_terminal(&error) => return Err(error),
+                    Err(error) => {
+                        log::debug!(
+                            "reverse endpoint {endpoint_id} accept response failed: {error}"
+                        );
+                        tokio::time::sleep(v2_backoff(attempt)).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                };
+                let accepted: ReverseAcceptResponse =
+                    serde_json::from_slice(&body).context("decoding reverse accept response")?;
+                if accepted.cursor < after {
+                    bail!("reverse accept cursor moved backwards");
+                }
+                return Ok(ReversePoll::Accepted(accepted));
+            }
+            Ok(response) if response.status() == StatusCode::CONFLICT => {
+                return Ok(ReversePoll::Reclaim)
+            }
+            Ok(response) if retryable_status(response.status()) => {
+                log::debug!(
+                    "reverse endpoint {endpoint_id} accept status {}",
+                    response.status()
+                );
+            }
+            Ok(response) => {
+                bail!(
+                    "server refused reverse accept for {endpoint_id}: {}",
+                    response.status()
+                )
+            }
+            Err(error) => log::debug!("reverse endpoint {endpoint_id} accept failed: {error}"),
+        }
+        tokio::time::sleep(v2_backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+async fn serve_reverse_endpoint(
+    ctx: Arc<TunnelCtx>,
+    mapping: ReverseMap,
+    owner_id: String,
+) -> Result<()> {
+    loop {
+        claim_reverse(&ctx, &mapping.endpoint_id, &owner_id).await?;
+        log::info!(
+            "reverse endpoint {} claimed; local target {}",
+            mapping.endpoint_id,
+            mapping.dial_target
+        );
+        let mut cursor = 0;
+        loop {
+            let accepted = match poll_reverse(&ctx, &mapping.endpoint_id, &owner_id, cursor).await?
+            {
+                ReversePoll::Accepted(response) => response,
+                ReversePoll::Reclaim => break,
+            };
+            cursor = accepted.cursor;
+            for conn in accepted.conns {
+                let ctx = ctx.clone();
+                let mapping = mapping.clone();
+                let owner_id = owner_id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_reverse_connection(ctx, mapping, owner_id, conn.id, conn.peer).await
+                    {
+                        log::debug!("reverse connection ended: {error}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_reverse_connection(
+    ctx: Arc<TunnelCtx>,
+    mapping: ReverseMap,
+    owner_id: String,
+    conn_id: String,
+    peer: String,
+) -> Result<()> {
+    let tcp = tokio::time::timeout(ctx.timeout, TcpStream::connect(&mapping.dial_target))
+        .await
+        .with_context(|| format!("dial {} timed out", mapping.dial_target))?
+        .with_context(|| format!("dial {} failed", mapping.dial_target))?;
+    let sid = new_sid();
+    let route = format!("attach:{}:{conn_id}", mapping.endpoint_id);
+    log::debug!(
+        "reverse endpoint {} attaching {peer} as session {sid}",
+        mapping.endpoint_id
+    );
+    let (sender, receiver) = open_tunnel_with_owner(ctx, sid, &route, Some(&owner_id)).await?;
+    bridge_tcp(tcp, sender, receiver).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4687,13 +5588,19 @@ mod tests {
         let proxy_port = proxy.local_addr().unwrap().port();
         let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let v2reg: V2Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let reverse: ReverseRegistry = Arc::new(tokio::sync::Mutex::new(ReverseState {
+            endpoints: HashMap::new(),
+            pending: 0,
+            max_pending: 1,
+        }));
         tokio::spawn(async move {
             let (stream, _) = proxy.accept().await.unwrap();
             let service = service_fn(move |req| {
                 let opts = opts.clone();
                 let reg = reg.clone();
                 let v2reg = v2reg.clone();
-                async move { handle(req, reg, v2reg, opts).await }
+                let reverse = reverse.clone();
+                async move { handle(req, reg, v2reg, reverse, opts).await }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -4744,13 +5651,19 @@ mod tests {
         let proxy_port = proxy.local_addr().unwrap().port();
         let reg: Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let v2reg: V2Registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let reverse: ReverseRegistry = Arc::new(tokio::sync::Mutex::new(ReverseState {
+            endpoints: HashMap::new(),
+            pending: 0,
+            max_pending: 1,
+        }));
         tokio::spawn(async move {
             let (stream, _) = proxy.accept().await.unwrap();
             let service = service_fn(move |req| {
                 let opts = opts.clone();
                 let reg = reg.clone();
                 let v2reg = v2reg.clone();
-                async move { handle(req, reg, v2reg, opts).await }
+                let reverse = reverse.clone();
+                async move { handle(req, reg, v2reg, reverse, opts).await }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -4773,6 +5686,97 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), "ok");
+    }
+
+    #[test]
+    fn reverse_config_parsers_enforce_fixed_safe_addresses() {
+        let endpoint: ReverseEndpointConfig = "probe=127.0.0.1:13129".parse().unwrap();
+        assert_eq!(endpoint.id, "probe");
+        assert!("probe=0.0.0.0:13129"
+            .parse::<ReverseEndpointConfig>()
+            .is_err());
+        assert!("bad:id=127.0.0.1:13129"
+            .parse::<ReverseEndpointConfig>()
+            .is_err());
+
+        let mapping: ReverseMap = "probe->127.0.0.1:3128".parse().unwrap();
+        assert_eq!(mapping.endpoint_id, "probe");
+        assert_eq!(mapping.dial_target, "127.0.0.1:3128");
+        assert!("probe->127.0.0.1:0".parse::<ReverseMap>().is_err());
+    }
+
+    #[tokio::test]
+    async fn reverse_claim_conflicts_until_owner_lease_expires() {
+        let registry: ReverseRegistry = Arc::new(tokio::sync::Mutex::new(ReverseState {
+            endpoints: HashMap::from([(
+                "probe".to_owned(),
+                ReverseEndpoint {
+                    owner: None,
+                    cursor: 0,
+                    conns: HashMap::new(),
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                },
+            )]),
+            pending: 0,
+            max_pending: 1,
+        }));
+        assert!(matches!(
+            claim_reverse_endpoint(&registry, "probe", "owner-one").await,
+            ReverseAccess::Ready(())
+        ));
+        assert!(matches!(
+            claim_reverse_endpoint(&registry, "probe", "owner-two").await,
+            ReverseAccess::Conflict
+        ));
+        {
+            let mut state = registry.lock().await;
+            let owner = state
+                .endpoints
+                .get_mut("probe")
+                .and_then(|endpoint| endpoint.owner.as_mut())
+                .unwrap();
+            owner.last_seen = Instant::now() - REVERSE_OWNER_IDLE - Duration::from_secs(1);
+        }
+        assert!(matches!(
+            claim_reverse_endpoint(&registry, "probe", "owner-two").await,
+            ReverseAccess::Ready(())
+        ));
+    }
+
+    #[tokio::test]
+    async fn reverse_pending_connection_expires_and_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(TcpStream::connect(address));
+        let (server, peer) = listener.accept().await.unwrap();
+        let mut client = client.await.unwrap().unwrap();
+        let conn_id = "0123456789abcdef0123456789abcdef".to_owned();
+        let mut endpoint = ReverseEndpoint {
+            owner: Some(ReverseOwner {
+                id: "owner-one".to_owned(),
+                last_seen: Instant::now(),
+            }),
+            cursor: 1,
+            conns: HashMap::from([(
+                conn_id,
+                AcceptedReverseConn {
+                    stream: server,
+                    peer,
+                    accepted_at: Instant::now() - REVERSE_PENDING_IDLE - Duration::from_secs(1),
+                    owner: "owner-one".to_owned(),
+                    cursor: 1,
+                },
+            )]),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        assert_eq!(expire_reverse_endpoint(&mut endpoint, Instant::now()), 1);
+        assert!(endpoint.conns.is_empty());
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
     }
 
     #[cfg(windows)]

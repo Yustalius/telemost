@@ -1,9 +1,10 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
 use httptun::{
-    run_mappings, selftest_ping, telemost_preset_maps_v1, throughput, tls_probe, ClientConfig,
-    Mode, PortMap, ProxyOpt, WireApi,
+    run_mappings, run_reverse, selftest_ping, telemost_preset_maps_v1, throughput, tls_probe,
+    ClientConfig, Mode, PortMap, ProxyOpt, ReverseMap, WireApi,
 };
 
 /// Fixed local TCP/UDP listeners tunneled to an httptun-server over ordinary HTTP.
@@ -17,6 +18,18 @@ struct Args {
     /// Fixed mapping, e.g. 'udp:23456->127.0.0.1:21116' (repeatable).
     #[arg(long = "map", value_name = "PROTO:LOCAL_PORT->TARGET")]
     mappings: Vec<PortMap>,
+
+    /// Reverse mapping, e.g. 'probe->127.0.0.1:3128' (repeatable).
+    #[arg(
+        long = "reverse-map",
+        value_name = "ENDPOINT->TARGET",
+        conflicts_with_all = ["mappings", "telemost_preset", "tls_probe", "selftest_ping", "throughput"]
+    )]
+    reverse_mappings: Vec<ReverseMap>,
+
+    /// File containing the persistent reverse owner id.
+    #[arg(long, value_name = "PATH", requires = "reverse_mappings")]
+    reverse_owner_file: Option<PathBuf>,
 
     /// Add telemost's four port mappings and use this host as the HTTPS server.
     #[arg(long, value_name = "VPS_HOST")]
@@ -44,8 +57,12 @@ struct Args {
     wire_api: Option<WireChoice>,
 
     /// Shared bearer token for the /api/v1/* and /api/v2/* APIs.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "token_file")]
     token: Option<String>,
+
+    /// Read the shared bearer token from a one-line file.
+    #[arg(long, value_name = "PATH", conflicts_with = "token")]
+    token_file: Option<PathBuf>,
 
     /// Upstream keepalive interval, seconds.
     #[arg(long, default_value_t = 15)]
@@ -106,6 +123,16 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     httptun_init_log(args.verbose);
 
+    let token = match args.token_file.as_deref() {
+        Some(path) => Some(read_one_line(path, "token")?),
+        None => args.token.clone(),
+    };
+    let reverse_owner = match args.reverse_owner_file.as_deref() {
+        Some(path) => Some(read_one_line(path, "reverse owner id")?),
+        None if args.reverse_mappings.is_empty() => None,
+        None => anyhow::bail!("--reverse-owner-file is required with --reverse-map"),
+    };
+
     let proxy = if args.no_proxy {
         ProxyOpt::Direct
     } else if let Some(u) = args.proxy.clone() {
@@ -123,11 +150,9 @@ async fn main() -> anyhow::Result<()> {
     let choice = args.wire_api.unwrap_or(WireChoice::V2);
     let wire = match choice {
         WireChoice::V2 => WireApi::V2 {
-            token: args.token.clone(),
+            token: token.clone(),
         },
-        WireChoice::V1 => WireApi::V1 {
-            token: args.token.clone(),
-        },
+        WireChoice::V1 => WireApi::V1 { token },
     };
     if matches!(wire, WireApi::V2 { .. }) && args.mode != Mode::Batch {
         anyhow::bail!("--wire-api v2 requires --mode batch");
@@ -143,7 +168,14 @@ async fn main() -> anyhow::Result<()> {
         wire,
     };
 
-    if let Some(url) = args.tls_probe.as_deref() {
+    if !args.reverse_mappings.is_empty() {
+        run_reverse(
+            cfg,
+            args.reverse_mappings,
+            reverse_owner.unwrap_or_default(),
+        )
+        .await
+    } else if let Some(url) = args.tls_probe.as_deref() {
         tls_probe(&cfg, url).await
     } else if args.selftest_ping {
         selftest_ping(&cfg, &args.to, args.count, args.size).await
@@ -156,6 +188,24 @@ async fn main() -> anyhow::Result<()> {
         }
         run_mappings(cfg, mappings).await
     }
+}
+
+fn read_one_line(path: &Path, label: &str) -> anyhow::Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("reading {label} file {}: {error}", path.display()))?;
+    let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+    let value = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{label} file {} is empty", path.display()))?;
+    if lines.next().is_some() {
+        anyhow::bail!(
+            "{label} file {} must contain one non-empty line",
+            path.display()
+        );
+    }
+    Ok(value.to_owned())
 }
 
 fn server_url(host: &str) -> String {
@@ -186,5 +236,30 @@ mod tests {
         assert_eq!(args.wire_api.unwrap_or(WireChoice::V2), WireChoice::V2);
         assert!(Args::try_parse_from(["httptun-client", "--wire-api", "legacy"]).is_err());
         assert!(Args::try_parse_from(["httptun-client", "--legacy"]).is_err());
+    }
+
+    #[test]
+    fn reverse_cli_is_isolated_from_forward_and_requires_owner_at_runtime() {
+        let args = Args::try_parse_from([
+            "httptun-client",
+            "--reverse-map",
+            "probe->127.0.0.1:3128",
+            "--reverse-owner-file",
+            "owner-id",
+        ])
+        .unwrap();
+        assert_eq!(args.reverse_mappings.len(), 1);
+        assert!(Args::try_parse_from([
+            "httptun-client",
+            "--reverse-map",
+            "probe->127.0.0.1:3128",
+            "--map",
+            "tcp:1234->echo:1234",
+        ])
+        .is_err());
+        assert!(
+            Args::try_parse_from(["httptun-client", "--token", "one", "--token-file", "two",])
+                .is_err()
+        );
     }
 }

@@ -1,0 +1,129 @@
+name: Build standalone httptun
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-artifact:
+        description: Upload artifacts and publish a GitHub prerelease
+        type: boolean
+        default: true
+      upload-tag:
+        description: GitHub release tag
+        type: string
+        default: manual
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Test httptun
+        run: cargo test -p httptun --locked -- --test-threads=1
+
+  linux-server:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build Linux x86_64 server
+        run: cargo build -p httptun --bin httptun-server --release --locked
+      - name: Package Linux server
+        if: ${{ inputs.upload-artifact }}
+        run: |
+          strip target/release/httptun-server
+          tar -C target/release -czf httptun-server-linux-x86_64.tar.gz httptun-server
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ inputs.upload-artifact }}
+        with:
+          name: httptun-server-linux-x86_64
+          path: httptun-server-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-client:
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build macOS arm64 client
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.3"
+        run: cargo build -p httptun --bin httptun-client --release --locked --target aarch64-apple-darwin
+      - name: Package macOS client
+        if: ${{ inputs.upload-artifact }}
+        run: |
+          strip target/aarch64-apple-darwin/release/httptun-client
+          tar -C target/aarch64-apple-darwin/release -czf httptun-client-macos-aarch64.tar.gz httptun-client
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ inputs.upload-artifact }}
+        with:
+          name: httptun-client-macos-aarch64
+          path: httptun-client-macos-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-client:
+    needs: test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build Windows x64 client
+        run: cargo build -p httptun --bin httptun-client --release --locked
+      - name: Package Windows client and SSH helper
+        if: ${{ inputs.upload-artifact }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package
+          Copy-Item target/release/httptun-client.exe package/
+          Copy-Item tools/httptun/windows-ssh-forward.ps1 package/
+          Compress-Archive -Path package/* -DestinationPath httptun-client-windows-x86_64.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ inputs.upload-artifact }}
+        with:
+          name: httptun-client-windows-x86_64
+          path: httptun-client-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [linux-server, macos-client, windows-client]
+    if: ${{ inputs.upload-artifact }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: httptun-*
+          path: release
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum httptun-*.tar.gz httptun-*.zip > SHA256SUMS
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ inputs.upload-tag }}
+          files: |
+            release/httptun-*.tar.gz
+            release/httptun-*.zip
+            release/SHA256SUMS
