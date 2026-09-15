@@ -16,9 +16,9 @@ CORP_URL="https://retest-agent.apps.yd-m6-kt66.vimpelcom.ru/"
 
 failures=0
 
-ok() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
-warn() { printf '  \033[33m!!\033[0m  %s\n' "$*"; }
-fail() { printf '  \033[31mxx\033[0m  %s\n' "$*"; failures=$((failures + 1)); }
+ok() { printf '\033[32m[OK]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*"; }
+fail() { printf '\033[31m[FAIL]\033[0m %s\n' "$*"; failures=$((failures + 1)); }
 
 http_code_ok() {
     case "$1" in
@@ -51,6 +51,7 @@ else
     fail "px не слушает порт $PX_PORT"
 fi
 
+client_running=0
 if [ -f "$PID_FILE" ]; then
     client_pid=$(sed -n '1p' "$PID_FILE")
 else
@@ -61,6 +62,7 @@ case "$client_pid" in
     *)
         if kill -0 "$client_pid" 2>/dev/null \
             && ps -p "$client_pid" -o command= 2>/dev/null | grep -q '[h]ttptun-client.*--reverse-map'; then
+            client_running=1
             ok "httptun-client запущен (pid $client_pid)"
         else
             fail "httptun-client из PID-файла не запущен"
@@ -92,7 +94,9 @@ else
 fi
 
 printf '%s\n' '== VPS reverse proxy load check =='
-if ! nc -G 8 -z "$VPS_HOST" 22 >/dev/null 2>&1; then
+if [ "$client_running" -ne 1 ]; then
+    warn "reverse load-check пропущен: сначала успешно запусти launcher"
+elif ! nc -G 8 -z "$VPS_HOST" 22 >/dev/null 2>&1; then
     fail "VPS:22 недоступен; удалённые проверки не запускались"
 else
     ok "VPS:22 доступен"

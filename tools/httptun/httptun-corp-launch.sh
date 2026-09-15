@@ -28,10 +28,10 @@ FORCE=0
 KRB5CCNAME_OVERRIDE=""
 
 say() { printf '%s\n' "$*"; }
-ok() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
-warn() { printf '  \033[33m!!\033[0m  %s\n' "$*"; }
-info() { printf '  \033[36m..\033[0m  %s\n' "$*"; }
-die() { printf '  \033[31mxx\033[0m  %s\n' "$*"; exit 1; }
+ok() { printf '\033[32m[OK]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*"; }
+info() { printf '\033[36m[INFO]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[FAIL]\033[0m %s\n' "$*"; exit 1; }
 usage() {
     printf '%s\n' \
         "Использование: $0 [start|--status|--stop|--diagnostic] [--force]" \
@@ -138,14 +138,23 @@ stop_client() {
     rm -f "$PID_FILE"
 }
 
-precheck() {
+precheck_egress() {
     local code
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 --noproxy '' \
         -x "http://127.0.0.1:$PX_PORT" "$SERVER_URL/health" 2>"$STATE_DIR/precheck-egress.log")
-    [ "$code" = 200 ] || return 1
+    [ "$code" = 200 ]
+}
+
+probe_corp_target() {
+    local code
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 --noproxy '' \
         -x "http://127.0.0.1:$PX_PORT" "$CORP_URL" 2>"$STATE_DIR/precheck-target.log")
-    [ "$code" != 000 ] && [ "$code" != 407 ]
+    case "$code" in
+        '' | 000 | 407 | 502)
+            warn "корпоративная тестовая цель сейчас не отвечает (HTTP ${code:-000}); туннель всё равно запускаю"
+            ;;
+        *) ok "корпоративная тестовая цель отвечает HTTP $code" ;;
+    esac
 }
 
 vps_bind_up() {
@@ -213,10 +222,10 @@ if [ ! -s "$OWNER_FILE" ]; then
 fi
 chmod 600 "$OWNER_FILE"
 
-if ! precheck; then
-    [ "$FORCE" -eq 1 ] && warn "предпроверка не прошла; продолжаю" || die "px/MWG предпроверка не прошла"
+if ! precheck_egress; then
+    [ "$FORCE" -eq 1 ] && warn "px/MWG не достигает VPS; продолжаю из-за --force" || die "px/MWG не достигает VPS /health"
 else
-    ok "px достигает VPS и корпоративной цели"
+    ok "px/MWG достигает VPS"
 fi
 
 stop_client
@@ -249,6 +258,7 @@ while [ "$attempt" -lt 120 ]; do
 done
 grep -q "reverse endpoint $ENDPOINT_ID claimed" "$HTTPTUN_LOG" || die "endpoint не claimed за 60 секунд"
 ok "reverse endpoint claimed"
+probe_corp_target
 vps_bind_up && ok "VPS bind :$VPS_BIND_PORT открыт" || warn "не удалось проверить VPS bind по SSH"
 e2e_probe
 say "Готово. Статус: $0 --status    Стоп: $0 --stop    Лог: $HTTPTUN_LOG"
