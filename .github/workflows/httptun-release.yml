@@ -75,7 +75,12 @@ jobs:
         if: ${{ inputs.upload-artifact }}
         run: |
           strip target/aarch64-apple-darwin/release/httptun-client
-          tar -C target/aarch64-apple-darwin/release -czf httptun-client-macos-aarch64.tar.gz httptun-client
+          mkdir package
+          cp target/aarch64-apple-darwin/release/httptun-client package/
+          cp tools/httptun/httptun-corp-launch.sh package/
+          cp tools/httptun/httptun-corp-diagnostic.sh package/
+          cp -R tools/httptun/diagnostics package/
+          tar -C package -czf httptun-client-macos-aarch64.tar.gz .
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ inputs.upload-artifact }}
         with:
@@ -104,6 +109,7 @@ jobs:
           New-Item -ItemType Directory -Path package
           Copy-Item target/release/httptun-client.exe package/
           Copy-Item tools/httptun/windows-ssh-forward.ps1 package/
+          Copy-Item tools/httptun/diagnostics/windows-edge-corp-profile.ps1 package/
           Compress-Archive -Path package/* -DestinationPath httptun-client-windows-x86_64.zip
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ inputs.upload-artifact }}

@@ -20,15 +20,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::channel::mpsc as fmpsc;
 use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, Uri};
-use http_body::Frame as BodyFrame;
+use http_body::{Body as _, Frame as BodyFrame};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -70,6 +70,99 @@ static V2_COUNTERS: V2Counters = V2Counters {
     sequence_conflicts: AtomicU64::new(0),
     session_losses: AtomicU64::new(0),
 };
+static HTTP_CONNECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static HTTP_GETS: AtomicU64 = AtomicU64::new(0);
+static HTTP_POSTS: AtomicU64 = AtomicU64::new(0);
+
+struct HttpConnectionGuard;
+
+impl Drop for HttpConnectionGuard {
+    fn drop(&mut self) {
+        HTTP_CONNECTIONS_ACTIVE.fetch_sub(1, Relaxed);
+    }
+}
+
+struct DiagnosticSink {
+    tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    role: String,
+    started: Instant,
+    wall_started_ms: u128,
+}
+
+static DIAGNOSTICS: OnceLock<DiagnosticSink> = OnceLock::new();
+
+/// Starts an opt-in JSONL event stream. Events contain only transport metadata;
+/// request headers, authentication data, and application payloads are never
+/// recorded.
+pub async fn enable_diagnostics(path: &std::path::Path, role: &str) -> Result<()> {
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("opening diagnostic log {}", path.display()))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let sink = DiagnosticSink {
+        tx,
+        role: role.to_owned(),
+        started: Instant::now(),
+        wall_started_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    };
+    DIAGNOSTICS
+        .set(sink)
+        .map_err(|_| anyhow!("diagnostics already enabled"))?;
+    tokio::spawn(async move {
+        let mut file = file;
+        while let Some(event) = rx.recv().await {
+            let mut line = match serde_json::to_vec(&event) {
+                Ok(line) => line,
+                Err(error) => {
+                    log::warn!("serializing diagnostic event failed: {error}");
+                    continue;
+                }
+            };
+            line.push(b'\n');
+            if let Err(error) = file.write_all(&line).await {
+                log::warn!("writing diagnostic event failed: {error}");
+                break;
+            }
+            if let Err(error) = file.flush().await {
+                log::warn!("flushing diagnostic events failed: {error}");
+                break;
+            }
+        }
+    });
+    diagnostic_event("process_start", serde_json::json!({}));
+    Ok(())
+}
+
+fn diagnostic_event(event: &str, fields: serde_json::Value) {
+    let Some(sink) = DIAGNOSTICS.get() else {
+        return;
+    };
+    let elapsed = sink.started.elapsed();
+    let mut record = serde_json::Map::new();
+    record.insert("schema".to_owned(), serde_json::json!(1));
+    record.insert("event".to_owned(), serde_json::json!(event));
+    record.insert("role".to_owned(), serde_json::json!(sink.role));
+    record.insert("pid".to_owned(), serde_json::json!(std::process::id()));
+    record.insert(
+        "monotonic_us".to_owned(),
+        serde_json::json!(elapsed.as_micros()),
+    );
+    record.insert(
+        "unix_ms".to_owned(),
+        serde_json::json!(sink.wall_started_ms.saturating_add(elapsed.as_millis())),
+    );
+    if let serde_json::Value::Object(fields) = fields {
+        record.extend(fields);
+    }
+    let _ = sink.tx.send(serde_json::Value::Object(record));
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V2Diagnostics {
@@ -224,6 +317,8 @@ pub struct ServerConfig {
     /// Fixed loopback listeners whose accepted TCP sockets are attached by a
     /// reverse client.
     pub reverse: Vec<ReverseEndpointConfig>,
+    /// Enable the authenticated, bounded reverse diagnostic runner.
+    pub reverse_diagnostics: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -675,8 +770,12 @@ fn reverse_text_resp(status: StatusCode, msg: &str) -> Response<BoxBody> {
 }
 
 fn reverse_json_resp<T: serde::Serialize>(value: &T) -> Response<BoxBody> {
+    reverse_json_status(StatusCode::OK, value)
+}
+
+fn reverse_json_status<T: serde::Serialize>(status: StatusCode, value: &T) -> Response<BoxBody> {
     match serde_json::to_vec(value) {
-        Ok(body) => finite_resp(StatusCode::OK, "application/json", Bytes::from(body)),
+        Ok(body) => finite_resp(status, "application/json", Bytes::from(body)),
         Err(error) => {
             log::error!("serializing reverse response failed: {error}");
             reverse_text_resp(StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
@@ -710,6 +809,81 @@ type Registry = Arc<tokio::sync::Mutex<HashMap<String, Arc<Session>>>>;
 type V2Registry = Arc<tokio::sync::Mutex<HashMap<String, V2Entry>>>;
 type VersionClaims = Arc<tokio::sync::Mutex<HashMap<String, VersionClaim>>>;
 type ReverseRegistry = Arc<tokio::sync::Mutex<ReverseState>>;
+type ReverseDiagnosticJobs = Arc<tokio::sync::Mutex<HashMap<String, ReverseDiagnosticJob>>>;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ReverseDiagnosticRequest {
+    endpoint_id: String,
+    run_id: String,
+    #[serde(default = "default_diagnostic_passes")]
+    passes: u8,
+}
+
+fn default_diagnostic_passes() -> u8 {
+    3
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ReverseDiagnosticJob {
+    schema: u8,
+    profile: &'static str,
+    endpoint_id: String,
+    run_id: String,
+    status: &'static str,
+    started_unix_ms: u128,
+    finished_unix_ms: Option<u128>,
+    completed_checks: usize,
+    failed_checks: usize,
+    skipped_checks: Vec<&'static str>,
+    error: Option<String>,
+    measurements: Vec<ReverseDiagnosticMeasurement>,
+    resources: Vec<ReverseDiagnosticResourceSample>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ReverseDiagnosticResourceSample {
+    unix_ms: u128,
+    v2_sessions: usize,
+    reverse_pending: usize,
+    rss_kib: Option<u64>,
+    cpu_ticks: Option<u64>,
+    http_connections_total: u64,
+    http_connections_active: u64,
+    http_gets: u64,
+    http_posts: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ReverseDiagnosticMeasurement {
+    pass: u8,
+    scenario: &'static str,
+    test_id: String,
+    concurrency: usize,
+    ok: bool,
+    expected_failure: bool,
+    error: Option<&'static str>,
+    connect_us: u128,
+    first_byte_us: Option<u128>,
+    total_us: u128,
+    bytes_up: usize,
+    bytes_down: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DiagnosticTargetRequest<'a> {
+    command: &'a str,
+    test_id: &'a str,
+    bytes: usize,
+    chunk_bytes: usize,
+    delay_ms: u64,
+    first_delay_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiagnosticTargetResponse {
+    ok: bool,
+    bytes: usize,
+}
 
 struct ReverseState {
     endpoints: HashMap<String, ReverseEndpoint>,
@@ -718,6 +892,7 @@ struct ReverseState {
 }
 
 struct ReverseEndpoint {
+    bind: SocketAddr,
     owner: Option<ReverseOwner>,
     cursor: u64,
     conns: HashMap<String, AcceptedReverseConn>,
@@ -822,6 +997,7 @@ struct ServerOpts {
     admission: Arc<tokio::sync::Semaphore>,
     claims: VersionClaims,
     next_generation: Arc<AtomicU64>,
+    reverse_diagnostics: Option<ReverseDiagnosticJobs>,
 }
 
 #[derive(Clone)]
@@ -854,6 +1030,7 @@ async fn start_reverse_endpoints(
         endpoints.insert(
             config.id.clone(),
             ReverseEndpoint {
+                bind: config.bind,
                 owner: None,
                 cursor: 0,
                 conns: HashMap::new(),
@@ -932,6 +1109,14 @@ async fn reverse_accept_loop(
                         owner: owner.id.clone(),
                         cursor,
                     },
+                );
+                diagnostic_event(
+                    "reverse_accept",
+                    serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "conn_id": conn_id,
+                        "peer": peer.to_string(),
+                    }),
                 );
                 log::debug!("reverse endpoint {endpoint_id} accepted {peer} as {conn_id}");
                 Some(endpoint.notify.clone())
@@ -1023,6 +1208,14 @@ async fn reverse_snapshot(
         .iter()
         .filter(|(_, conn)| conn.owner == owner_id && conn.cursor > after)
         .map(|(id, conn)| {
+            diagnostic_event(
+                "reverse_accept_delivered",
+                serde_json::json!({
+                    "endpoint_id": endpoint_id,
+                    "conn_id": id,
+                    "accept_wait_us": conn.accepted_at.elapsed().as_micros(),
+                }),
+            );
             (
                 conn.cursor,
                 ReverseAcceptConn {
@@ -1065,6 +1258,14 @@ async fn take_reverse_conn(
     }
     let stream = endpoint.conns.remove(&attach.conn_id).and_then(|conn| {
         if conn.owner == owner_id {
+            diagnostic_event(
+                "reverse_attach",
+                serde_json::json!({
+                    "endpoint_id": attach.endpoint_id,
+                    "conn_id": attach.conn_id,
+                    "accept_to_attach_us": conn.accepted_at.elapsed().as_micros(),
+                }),
+            );
             Some(conn.stream)
         } else {
             None
@@ -1117,6 +1318,676 @@ fn parse_reverse_attach(route: &str) -> std::result::Result<Option<ReverseAttach
     }))
 }
 
+async fn handle_reverse_diagnostic_run(
+    req: Request<Incoming>,
+    reverse: &ReverseRegistry,
+    v2reg: &V2Registry,
+    opts: &ServerOpts,
+) -> Response<BoxBody> {
+    let Some(jobs) = opts.reverse_diagnostics.as_ref() else {
+        return reverse_text_resp(StatusCode::NOT_FOUND, "not found\n");
+    };
+    let body = match read_v2_body(req.into_body()).await {
+        Ok(body) => body,
+        Err(_) => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid request\n"),
+    };
+    let request: ReverseDiagnosticRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid request\n"),
+    };
+    if validate_reverse_id(&request.endpoint_id, "endpoint id").is_err()
+        || validate_reverse_id(&request.run_id, "run id").is_err()
+        || request.run_id.len() > 64
+        || !(1..=3).contains(&request.passes)
+    {
+        return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid request\n");
+    }
+    let bind = {
+        let state = reverse.lock().await;
+        match state.endpoints.get(&request.endpoint_id) {
+            Some(endpoint) if endpoint.owner.is_some() => endpoint.bind,
+            Some(_) => return reverse_text_resp(StatusCode::CONFLICT, "endpoint not claimed\n"),
+            None => return reverse_text_resp(StatusCode::NOT_FOUND, "unknown endpoint\n"),
+        }
+    };
+    {
+        let mut jobs = jobs.lock().await;
+        if jobs.contains_key(&request.run_id) {
+            return reverse_text_resp(StatusCode::CONFLICT, "run already exists\n");
+        }
+        if jobs.values().filter(|job| job.status == "running").count() >= 1 {
+            return reverse_text_resp(StatusCode::TOO_MANY_REQUESTS, "diagnostic run active\n");
+        }
+        if jobs.len() >= 16 {
+            if let Some(oldest) = jobs
+                .iter()
+                .filter(|(_, job)| job.status != "running")
+                .min_by_key(|(_, job)| job.started_unix_ms)
+                .map(|(run_id, _)| run_id.clone())
+            {
+                jobs.remove(&oldest);
+            } else {
+                return reverse_text_resp(StatusCode::TOO_MANY_REQUESTS, "job limit reached\n");
+            }
+        }
+        jobs.insert(
+            request.run_id.clone(),
+            ReverseDiagnosticJob {
+                schema: 1,
+                profile: "A-v2-baseline",
+                endpoint_id: request.endpoint_id.clone(),
+                run_id: request.run_id.clone(),
+                status: "running",
+                started_unix_ms: unix_time_ms(),
+                finished_unix_ms: None,
+                completed_checks: 0,
+                failed_checks: 0,
+                skipped_checks: vec![
+                    "transport_fault_injection_local_only",
+                    "packet_capture_optional",
+                ],
+                error: None,
+                measurements: Vec::new(),
+                resources: Vec::new(),
+            },
+        );
+    }
+    let jobs_for_task = jobs.clone();
+    let jobs_for_sampler = jobs.clone();
+    let reverse_for_sampler = reverse.clone();
+    let v2reg_for_sampler = v2reg.clone();
+    let request_for_task = request.clone();
+    let sampler_run_id = request.run_id.clone();
+    let (stop_sampler, mut sampler_stopped) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let sample = reverse_diagnostic_resource_sample(
+                        &v2reg_for_sampler,
+                        &reverse_for_sampler,
+                    ).await;
+                    if let Some(job) = jobs_for_sampler.lock().await.get_mut(&sampler_run_id) {
+                        job.resources.push(sample);
+                    }
+                }
+                _ = &mut sampler_stopped => break,
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let result = run_reverse_diagnostic_suite(bind, &request_for_task).await;
+        let _ = stop_sampler.send(());
+        let mut jobs = jobs_for_task.lock().await;
+        let Some(job) = jobs.get_mut(&request_for_task.run_id) else {
+            return;
+        };
+        job.finished_unix_ms = Some(unix_time_ms());
+        match result {
+            Ok(measurements) => {
+                job.completed_checks = measurements.len();
+                job.failed_checks = measurements.iter().filter(|item| !item.ok).count();
+                job.measurements = measurements;
+                job.status = "complete";
+            }
+            Err(error) => {
+                job.status = "error";
+                job.error = Some(error.to_string());
+            }
+        }
+    });
+    reverse_json_status(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({
+            "run_id": request.run_id,
+            "status": "running",
+        }),
+    )
+}
+
+async fn reverse_diagnostic_resource_sample(
+    v2reg: &V2Registry,
+    reverse: &ReverseRegistry,
+) -> ReverseDiagnosticResourceSample {
+    let v2_sessions = v2reg.lock().await.len();
+    let reverse_pending = reverse.lock().await.pending;
+    let (rss_kib, cpu_ticks) = read_linux_process_resources().await;
+    ReverseDiagnosticResourceSample {
+        unix_ms: unix_time_ms(),
+        v2_sessions,
+        reverse_pending,
+        rss_kib,
+        cpu_ticks,
+        http_connections_total: HTTP_CONNECTIONS_TOTAL.load(Relaxed),
+        http_connections_active: HTTP_CONNECTIONS_ACTIVE.load(Relaxed),
+        http_gets: HTTP_GETS.load(Relaxed),
+        http_posts: HTTP_POSTS.load(Relaxed),
+    }
+}
+
+async fn read_linux_process_resources() -> (Option<u64>, Option<u64>) {
+    let rss_kib = match tokio::fs::read_to_string("/proc/self/status").await {
+        Ok(status) => status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        }),
+        Err(_) => None,
+    };
+    let cpu_ticks = match tokio::fs::read_to_string("/proc/self/stat").await {
+        Ok(stat) => stat.rsplit_once(") ").and_then(|(_, fields)| {
+            let fields = fields.split_whitespace().collect::<Vec<_>>();
+            let user = fields.get(11)?.parse::<u64>().ok()?;
+            let system = fields.get(12)?.parse::<u64>().ok()?;
+            Some(user.saturating_add(system))
+        }),
+        Err(_) => None,
+    };
+    (rss_kib, cpu_ticks)
+}
+
+async fn handle_reverse_diagnostic_status(
+    req: Request<Incoming>,
+    opts: &ServerOpts,
+) -> Response<BoxBody> {
+    let Some(jobs) = opts.reverse_diagnostics.as_ref() else {
+        return reverse_text_resp(StatusCode::NOT_FOUND, "not found\n");
+    };
+    let Some(run_id) = query_param(req.uri(), "run") else {
+        return reverse_text_resp(StatusCode::BAD_REQUEST, "missing run id\n");
+    };
+    if validate_reverse_id(&run_id, "run id").is_err() {
+        return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid run id\n");
+    }
+    let job = jobs.lock().await.get(&run_id).cloned();
+    match job {
+        Some(job) => reverse_json_resp(&job),
+        None => reverse_text_resp(StatusCode::NOT_FOUND, "unknown run\n"),
+    }
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+async fn run_reverse_diagnostic_suite(
+    bind: SocketAddr,
+    request: &ReverseDiagnosticRequest,
+) -> Result<Vec<ReverseDiagnosticMeasurement>> {
+    let mut measurements = Vec::new();
+    for pass in 1..=request.passes {
+        for index in 0..10usize {
+            let test_id = format!("{}-p{pass}-short-{index}", request.run_id);
+            measurements.push(
+                run_reverse_diagnostic_exchange(
+                    bind,
+                    pass,
+                    "short_sequential",
+                    test_id,
+                    1,
+                    "exchange",
+                    256,
+                    0,
+                    0,
+                    false,
+                    false,
+                )
+                .await,
+            );
+        }
+        for concurrency in [1usize, 8, 32] {
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in 0..concurrency {
+                let test_id = format!("{}-p{pass}-parallel-{concurrency}-{index}", request.run_id);
+                tasks.spawn(run_reverse_diagnostic_exchange(
+                    bind,
+                    pass,
+                    "parallel_short",
+                    test_id,
+                    concurrency,
+                    "exchange",
+                    256,
+                    0,
+                    0,
+                    false,
+                    false,
+                ));
+            }
+            while let Some(result) = tasks.join_next().await {
+                measurements.push(result.context("parallel diagnostic task failed")?);
+            }
+        }
+        for bytes in [64 * 1024usize, 1024 * 1024] {
+            let test_id = format!("{}-p{pass}-download-{bytes}", request.run_id);
+            measurements.push(
+                run_reverse_diagnostic_exchange(
+                    bind, pass, "download", test_id, 1, "download", bytes, 0, 0, false, false,
+                )
+                .await,
+            );
+            let test_id = format!("{}-p{pass}-upload-{bytes}", request.run_id);
+            measurements.push(
+                run_reverse_diagnostic_exchange(
+                    bind, pass, "upload", test_id, 1, "upload", bytes, 0, 0, false, false,
+                )
+                .await,
+            );
+        }
+
+        let background_id = format!("{}-p{pass}-background", request.run_id);
+        let background = tokio::spawn(run_reverse_diagnostic_exchange(
+            bind,
+            pass,
+            "background_download",
+            background_id,
+            1,
+            "download",
+            2 * 1024 * 1024,
+            16 * 1024,
+            2,
+            false,
+            false,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut foreground = tokio::task::JoinSet::new();
+        for index in 0..8usize {
+            foreground.spawn(run_reverse_diagnostic_exchange(
+                bind,
+                pass,
+                "short_with_background",
+                format!("{}-p{pass}-foreground-{index}", request.run_id),
+                8,
+                "exchange",
+                256,
+                0,
+                0,
+                false,
+                false,
+            ));
+        }
+        while let Some(result) = foreground.join_next().await {
+            measurements.push(result.context("foreground diagnostic task failed")?);
+        }
+        measurements.push(
+            background
+                .await
+                .context("background diagnostic task failed")?,
+        );
+
+        measurements.push(
+            run_reverse_diagnostic_idle(bind, pass, format!("{}-p{pass}-idle", request.run_id))
+                .await,
+        );
+        let slow_receiver = tokio::spawn(run_reverse_diagnostic_exchange(
+            bind,
+            pass,
+            "slow_receiver",
+            format!("{}-p{pass}-slow", request.run_id),
+            1,
+            "download",
+            512 * 1024,
+            8 * 1024,
+            0,
+            true,
+            false,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut slow_neighbors = tokio::task::JoinSet::new();
+        for index in 0..8usize {
+            slow_neighbors.spawn(run_reverse_diagnostic_exchange(
+                bind,
+                pass,
+                "short_with_slow_receiver",
+                format!("{}-p{pass}-slow-neighbor-{index}", request.run_id),
+                8,
+                "exchange",
+                256,
+                0,
+                0,
+                false,
+                false,
+            ));
+        }
+        while let Some(result) = slow_neighbors.join_next().await {
+            measurements.push(result.context("slow-neighbor diagnostic task failed")?);
+        }
+        measurements.push(
+            slow_receiver
+                .await
+                .context("slow-receiver diagnostic task failed")?,
+        );
+        measurements.push(
+            run_reverse_diagnostic_exchange(
+                bind,
+                pass,
+                "half_close",
+                format!("{}-p{pass}-half-close", request.run_id),
+                1,
+                "download",
+                64 * 1024,
+                0,
+                0,
+                false,
+                true,
+            )
+            .await,
+        );
+        measurements.push(
+            run_reverse_diagnostic_exchange(
+                bind,
+                pass,
+                "reset",
+                format!("{}-p{pass}-reset", request.run_id),
+                1,
+                "reset",
+                0,
+                0,
+                0,
+                false,
+                false,
+            )
+            .await,
+        );
+    }
+    Ok(measurements)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_reverse_diagnostic_exchange(
+    bind: SocketAddr,
+    pass: u8,
+    scenario: &'static str,
+    test_id: String,
+    concurrency: usize,
+    command: &'static str,
+    bytes: usize,
+    chunk_bytes: usize,
+    delay_ms: u64,
+    slow_receiver: bool,
+    half_close: bool,
+) -> ReverseDiagnosticMeasurement {
+    let started = Instant::now();
+    let expected_failure = command == "reset";
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let connect_started = Instant::now();
+        let mut stream = TcpStream::connect(bind)
+            .await
+            .context("connecting reverse diagnostic endpoint")?;
+        let connect_us = connect_started.elapsed().as_micros();
+        let request = DiagnosticTargetRequest {
+            command,
+            test_id: &test_id,
+            bytes,
+            chunk_bytes: if chunk_bytes == 0 {
+                16 * 1024
+            } else {
+                chunk_bytes
+            },
+            delay_ms,
+            first_delay_ms: 0,
+        };
+        write_diagnostic_target_request(&mut stream, &request).await?;
+        let mut bytes_up = 0usize;
+        if command == "upload" || command == "exchange" {
+            write_diagnostic_pattern(&mut stream, bytes).await?;
+            bytes_up = bytes;
+        }
+        if half_close {
+            stream
+                .shutdown()
+                .await
+                .context("half-closing diagnostic stream")?;
+        }
+        let response_started = Instant::now();
+        let response = read_diagnostic_target_response(&mut stream).await;
+        if expected_failure {
+            return match response {
+                Err(_) => Ok((
+                    connect_us,
+                    Some(response_started.elapsed().as_micros()),
+                    0,
+                    0,
+                )),
+                Ok(_) => bail!("reset target returned a response"),
+            };
+        }
+        let (response, first_byte_us) = response?;
+        if !response.ok || response.bytes != bytes {
+            bail!("diagnostic target rejected data");
+        }
+        let bytes_down = if command == "download" || command == "exchange" {
+            read_diagnostic_pattern(&mut stream, response.bytes, slow_receiver).await?;
+            response.bytes
+        } else {
+            0
+        };
+        Ok((connect_us, Some(first_byte_us), bytes_up, bytes_down))
+    })
+    .await;
+
+    let (ok, error, connect_us, first_byte_us, bytes_up, bytes_down) = match result {
+        Ok(Ok((connect_us, first_byte_us, bytes_up, bytes_down))) => {
+            (true, None, connect_us, first_byte_us, bytes_up, bytes_down)
+        }
+        Ok(Err(error)) => {
+            log::debug!("reverse diagnostic {scenario} failed: {error}");
+            (
+                false,
+                Some(classify_diagnostic_error(&error)),
+                0,
+                None,
+                0,
+                0,
+            )
+        }
+        Err(_) => (false, Some("timeout"), 0, None, 0, 0),
+    };
+    diagnostic_event(
+        "reverse_diagnostic_measurement",
+        serde_json::json!({
+            "run_id": test_id.split("-p").next().unwrap_or_default(),
+            "test_id": test_id,
+            "scenario": scenario,
+            "pass": pass,
+            "concurrency": concurrency,
+            "ok": ok,
+            "expected_failure": expected_failure,
+            "connect_us": connect_us,
+            "first_byte_us": first_byte_us,
+            "total_us": started.elapsed().as_micros(),
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
+        }),
+    );
+    ReverseDiagnosticMeasurement {
+        pass,
+        scenario,
+        test_id,
+        concurrency,
+        ok,
+        expected_failure,
+        error,
+        connect_us,
+        first_byte_us,
+        total_us: started.elapsed().as_micros(),
+        bytes_up,
+        bytes_down,
+    }
+}
+
+async fn run_reverse_diagnostic_idle(
+    bind: SocketAddr,
+    pass: u8,
+    test_id: String,
+) -> ReverseDiagnosticMeasurement {
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let connect_started = Instant::now();
+        let mut stream = TcpStream::connect(bind).await?;
+        let connect_us = connect_started.elapsed().as_micros();
+        for suffix in ["before", "after"] {
+            let command_id = format!("{test_id}-{suffix}");
+            write_diagnostic_target_request(
+                &mut stream,
+                &DiagnosticTargetRequest {
+                    command: "exchange",
+                    test_id: &command_id,
+                    bytes: 256,
+                    chunk_bytes: 16 * 1024,
+                    delay_ms: 0,
+                    first_delay_ms: 0,
+                },
+            )
+            .await?;
+            write_diagnostic_pattern(&mut stream, 256).await?;
+            let (response, _) = read_diagnostic_target_response(&mut stream).await?;
+            if !response.ok || response.bytes != 256 {
+                bail!("idle target response mismatch");
+            }
+            read_diagnostic_pattern(&mut stream, 256, false).await?;
+            if suffix == "before" {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
+        }
+        Ok::<_, anyhow::Error>(connect_us)
+    })
+    .await;
+    let (ok, error, connect_us) = match result {
+        Ok(Ok(connect_us)) => (true, None, connect_us),
+        Ok(Err(error)) => {
+            log::debug!("reverse diagnostic idle failed: {error}");
+            (false, Some(classify_diagnostic_error(&error)), 0)
+        }
+        Err(_) => (false, Some("timeout"), 0),
+    };
+    ReverseDiagnosticMeasurement {
+        pass,
+        scenario: "idle_resume",
+        test_id,
+        concurrency: 1,
+        ok,
+        expected_failure: false,
+        error,
+        connect_us,
+        first_byte_us: None,
+        total_us: started.elapsed().as_micros(),
+        bytes_up: if ok { 512 } else { 0 },
+        bytes_down: if ok { 512 } else { 0 },
+    }
+}
+
+async fn write_diagnostic_target_request(
+    stream: &mut TcpStream,
+    request: &DiagnosticTargetRequest<'_>,
+) -> Result<()> {
+    let mut line = serde_json::to_vec(request).context("encoding diagnostic request")?;
+    if line.len() > 4095 {
+        bail!("diagnostic request is too large");
+    }
+    line.push(b'\n');
+    stream
+        .write_all(&line)
+        .await
+        .context("writing diagnostic request")
+}
+
+async fn read_diagnostic_target_response(
+    stream: &mut TcpStream,
+) -> Result<(DiagnosticTargetResponse, u128)> {
+    let started = Instant::now();
+    let mut line = Vec::with_capacity(256);
+    let mut first_byte_us = None;
+    loop {
+        let mut byte = [0u8; 1];
+        let count = stream
+            .read(&mut byte)
+            .await
+            .context("reading diagnostic response")?;
+        if count == 0 {
+            bail!("diagnostic response EOF");
+        }
+        first_byte_us.get_or_insert_with(|| started.elapsed().as_micros());
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= 4095 {
+            bail!("diagnostic response header is too large");
+        }
+        line.push(byte[0]);
+    }
+    let response = serde_json::from_slice(&line).context("decoding diagnostic response")?;
+    Ok((response, first_byte_us.unwrap_or_default()))
+}
+
+async fn write_diagnostic_pattern(stream: &mut TcpStream, bytes: usize) -> Result<()> {
+    let mut offset = 0usize;
+    let mut buffer = vec![0u8; 16 * 1024];
+    while offset < bytes {
+        let count = (bytes - offset).min(buffer.len());
+        for (index, byte) in buffer[..count].iter_mut().enumerate() {
+            *byte = ((offset + index) % 251) as u8;
+        }
+        stream
+            .write_all(&buffer[..count])
+            .await
+            .context("writing diagnostic payload")?;
+        offset += count;
+    }
+    Ok(())
+}
+
+async fn read_diagnostic_pattern(
+    stream: &mut TcpStream,
+    bytes: usize,
+    slow_receiver: bool,
+) -> Result<()> {
+    let mut offset = 0usize;
+    let mut buffer = vec![0u8; if slow_receiver { 4 * 1024 } else { 32 * 1024 }];
+    while offset < bytes {
+        let capacity = buffer.len();
+        let count = stream
+            .read(&mut buffer[..(bytes - offset).min(capacity)])
+            .await
+            .context("reading diagnostic payload")?;
+        if count == 0 {
+            bail!("diagnostic payload EOF");
+        }
+        if buffer[..count]
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte != ((offset + index) % 251) as u8)
+        {
+            bail!("diagnostic payload mismatch");
+        }
+        offset += count;
+        if slow_receiver {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    Ok(())
+}
+
+fn classify_diagnostic_error(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("mismatch") || message.contains("rejected") {
+        "integrity"
+    } else if message.contains("EOF") {
+        "eof"
+    } else if message.contains("connect") {
+        "connect"
+    } else if message.contains("decode") {
+        "protocol"
+    } else {
+        "io"
+    }
+}
+
 pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen)
         .await
@@ -1127,6 +1998,9 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
 /// Like [`run_server`] but on an already-bound listener (handy for embedding and
 /// tests that need to know the actual port before the server starts).
 pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
+    if cfg.reverse_diagnostics && cfg.auth_token.is_none() {
+        bail!("reverse diagnostics require --auth-token");
+    }
     let tls = build_server_tls(&cfg).context("building TLS config")?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let local = listener.local_addr().ok();
@@ -1158,14 +2032,20 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         admission: Arc::new(tokio::sync::Semaphore::new(cfg.max_sessions.max(1))),
         claims,
         next_generation: Arc::new(AtomicU64::new(1)),
+        reverse_diagnostics: cfg
+            .reverse_diagnostics
+            .then(|| Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
     };
 
     spawn_sweeper(reg.clone(), opts.claims.clone());
     spawn_v2_sweeper(v2reg.clone(), opts.claims.clone());
     spawn_claim_sweeper(opts.claims.clone());
+    if DIAGNOSTICS.get().is_some() {
+        spawn_diagnostic_sampler(reg.clone(), v2reg.clone(), reverse.clone(), opts.clone());
+    }
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, reverse={}, max_sessions={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, reverse={}, reverse_diagnostics={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
         cfg.echo_all,
@@ -1173,6 +2053,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         opts.dashboard.is_some(),
         opts.routes.len(),
         cfg.reverse.len(),
+        opts.reverse_diagnostics.is_some(),
         opts.max_sessions,
     );
 
@@ -1184,12 +2065,15 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
                 continue;
             }
         };
+        HTTP_CONNECTIONS_TOTAL.fetch_add(1, Relaxed);
+        HTTP_CONNECTIONS_ACTIVE.fetch_add(1, Relaxed);
         let acceptor = acceptor.clone();
         let reg = reg.clone();
         let v2reg = v2reg.clone();
         let reverse = reverse.clone();
         let opts = opts.clone();
         tokio::spawn(async move {
+            let _connection_guard = HttpConnectionGuard;
             let tls = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1218,6 +2102,58 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
             }
         });
     }
+}
+
+fn spawn_diagnostic_sampler(
+    reg: Registry,
+    v2reg: V2Registry,
+    reverse: ReverseRegistry,
+    opts: ServerOpts,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let v1_sessions = reg.lock().await.len();
+            let (v2_opening, v2_ready) = {
+                let guard = v2reg.lock().await;
+                guard
+                    .values()
+                    .fold((0usize, 0usize), |(opening, ready), entry| match entry {
+                        V2Entry::Opening { .. } => (opening + 1, ready),
+                        V2Entry::Ready { .. } => (opening, ready + 1),
+                    })
+            };
+            let (reverse_pending, reverse_owned) = {
+                let state = reverse.lock().await;
+                (
+                    state.pending,
+                    state
+                        .endpoints
+                        .values()
+                        .filter(|endpoint| endpoint.owner.is_some())
+                        .count(),
+                )
+            };
+            diagnostic_event(
+                "server_snapshot",
+                serde_json::json!({
+                    "v1_sessions": v1_sessions,
+                    "v2_opening": v2_opening,
+                    "v2_ready": v2_ready,
+                    "reverse_pending": reverse_pending,
+                    "reverse_owned": reverse_owned,
+                    "admission_used": opts.max_sessions.saturating_sub(opts.admission.available_permits()),
+                    "counters": {
+                        "retries": V2_COUNTERS.retries.load(Relaxed),
+                        "upstream_duplicates": V2_COUNTERS.upstream_duplicates.load(Relaxed),
+                        "downstream_replays": V2_COUNTERS.downstream_replays.load(Relaxed),
+                        "sequence_conflicts": V2_COUNTERS.sequence_conflicts.load(Relaxed),
+                        "session_losses": V2_COUNTERS.session_losses.load(Relaxed),
+                    },
+                }),
+            );
+        }
+    });
 }
 
 fn spawn_sweeper(reg: Registry, claims: VersionClaims) {
@@ -1346,8 +2282,23 @@ async fn handle(
     reverse: ReverseRegistry,
     opts: ServerOpts,
 ) -> Result<Response<BoxBody>, Infallible> {
+    let started = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    let request_bytes = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    match &method {
+        &Method::GET => {
+            HTTP_GETS.fetch_add(1, Relaxed);
+        }
+        &Method::POST => {
+            HTTP_POSTS.fetch_add(1, Relaxed);
+        }
+        _ => {}
+    }
     log::debug!("--> {method} {path}");
 
     // Every /api/v1/* and /api/v2/* request must carry the shared bearer token (when set).
@@ -1363,6 +2314,17 @@ async fn handle(
             text_resp(StatusCode::UNAUTHORIZED, "unauthorized\n")
         };
         log::debug!("<-- {method} {path} {}", resp.status());
+        diagnostic_event(
+            "http_request",
+            serde_json::json!({
+                "method": method.as_str(),
+                "path": path,
+                "status": resp.status().as_u16(),
+                "request_bytes": request_bytes,
+                "response_bytes": resp.body().size_hint().exact(),
+                "duration_us": started.elapsed().as_micros(),
+            }),
+        );
         return Ok(resp);
     }
 
@@ -1376,6 +2338,12 @@ async fn handle(
             (&Method::POST, "/api/v2/session/close") => handle_close_v2(req, &v2reg, &opts).await,
             (&Method::POST, "/api/v2/reverse/claim") => handle_reverse_claim(req, &reverse).await,
             (&Method::GET, "/api/v2/reverse/accept") => handle_reverse_accept(req, &reverse).await,
+            (&Method::POST, "/api/v2/reverse/diagnostics/run") => {
+                handle_reverse_diagnostic_run(req, &reverse, &v2reg, &opts).await
+            }
+            (&Method::GET, "/api/v2/reverse/diagnostics/status") => {
+                handle_reverse_diagnostic_status(req, &opts).await
+            }
             (_, "/api/v2/session/open") => method_not_allowed("POST", method == Method::HEAD),
             (_, "/api/v2/session/send") => method_not_allowed("POST", method == Method::HEAD),
             (_, "/api/v2/session/recv") => method_not_allowed("GET", method == Method::HEAD),
@@ -1384,6 +2352,12 @@ async fn handle(
                 reverse_method_not_allowed("POST", method == Method::HEAD)
             }
             (_, "/api/v2/reverse/accept") => {
+                reverse_method_not_allowed("GET", method == Method::HEAD)
+            }
+            (_, "/api/v2/reverse/diagnostics/run") => {
+                reverse_method_not_allowed("POST", method == Method::HEAD)
+            }
+            (_, "/api/v2/reverse/diagnostics/status") => {
                 reverse_method_not_allowed("GET", method == Method::HEAD)
             }
             (_, path) if path == "/api/v2/reverse" || path.starts_with("/api/v2/reverse/") => {
@@ -1434,6 +2408,17 @@ async fn handle(
         neutral_resp(StatusCode::NOT_FOUND, method == Method::HEAD)
     };
     log::debug!("<-- {method} {path} {}", resp.status());
+    diagnostic_event(
+        "http_request",
+        serde_json::json!({
+            "method": method.as_str(),
+            "path": path,
+            "status": resp.status().as_u16(),
+            "request_bytes": request_bytes,
+            "response_bytes": resp.body().size_hint().exact(),
+            "duration_us": started.elapsed().as_micros(),
+        }),
+    );
     Ok(resp)
 }
 
@@ -2593,6 +3578,7 @@ async fn v2_up_sender(
 }
 
 async fn handle_up_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<BoxBody> {
+    let started = Instant::now();
     let sid = match query_param(req.uri(), "s") {
         Some(s) => s,
         None => return text_resp(StatusCode::BAD_REQUEST, "missing session id\n"),
@@ -2612,6 +3598,15 @@ async fn handle_up_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<BoxB
         Ok(f) => f,
         Err(_) => return text_resp(StatusCode::BAD_REQUEST, "invalid frames\n"),
     };
+    let frame_count = frames.len();
+    let data_bytes = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            V2Frame::Data(data) => Some(data.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let request_bytes = raw.len();
     let (tx, inflight) = match v2_up_sender(reg, &sid, seq, &raw).await {
         Ok(value) => value,
         Err(s) => return text_resp(s, "session unavailable\n"),
@@ -2632,8 +3627,36 @@ async fn handle_up_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<BoxB
         return text_resp(StatusCode::GONE, "session lost\n");
     }
     match rx.await {
-        Ok((status, body)) if status.is_success() => octet_resp(body),
+        Ok((status, body)) if status.is_success() => {
+            diagnostic_event(
+                "v2_server_send",
+                serde_json::json!({
+                    "sid": sid,
+                    "seq": seq,
+                    "status": status.as_u16(),
+                    "request_bytes": request_bytes,
+                    "response_bytes": body.len(),
+                    "frames": frame_count,
+                    "data_bytes": data_bytes,
+                    "queue_wait_us": started.elapsed().as_micros(),
+                }),
+            );
+            octet_resp(body)
+        }
         Ok((status, body)) => {
+            diagnostic_event(
+                "v2_server_send",
+                serde_json::json!({
+                    "sid": sid,
+                    "seq": seq,
+                    "status": status.as_u16(),
+                    "request_bytes": request_bytes,
+                    "response_bytes": body.len(),
+                    "frames": frame_count,
+                    "data_bytes": data_bytes,
+                    "queue_wait_us": started.elapsed().as_micros(),
+                }),
+            );
             let mut response = text_resp(status, "");
             *response.body_mut() = full(body);
             response
@@ -2658,6 +3681,7 @@ fn validate_v2_up(frames: Vec<V2Frame>) -> Result<Vec<V2Frame>> {
 }
 
 async fn handle_down_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<BoxBody> {
+    let started = Instant::now();
     let sid = match query_param(req.uri(), "s") {
         Some(s) => s,
         None => return text_resp(StatusCode::BAD_REQUEST, "missing session id\n"),
@@ -2676,8 +3700,31 @@ async fn handle_down_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<Bo
         return text_resp(StatusCode::GONE, "session lost\n");
     }
     match rx.await {
-        Ok((status, body)) if status.is_success() => octet_resp(body),
+        Ok((status, body)) if status.is_success() => {
+            diagnostic_event(
+                "v2_server_recv",
+                serde_json::json!({
+                    "sid": sid,
+                    "seq": seq,
+                    "status": status.as_u16(),
+                    "response_bytes": body.len(),
+                    "fill_ratio": body.len() as f64 / MAX_BATCH as f64,
+                    "queue_wait_us": started.elapsed().as_micros(),
+                }),
+            );
+            octet_resp(body)
+        }
         Ok((status, body)) => {
+            diagnostic_event(
+                "v2_server_recv",
+                serde_json::json!({
+                    "sid": sid,
+                    "seq": seq,
+                    "status": status.as_u16(),
+                    "response_bytes": body.len(),
+                    "queue_wait_us": started.elapsed().as_micros(),
+                }),
+            );
             let mut response = text_resp(status, "");
             *response.body_mut() = full(body);
             response
@@ -3309,6 +4356,7 @@ async fn open_tunnel_with_owner(
     target: &str,
     owner_id: Option<&str>,
 ) -> Result<(TunnelSender, TunnelReceiver)> {
+    let operation_started = Instant::now();
     let owner_query = owner_id
         .map(|owner| format!("&owner={owner}"))
         .unwrap_or_default();
@@ -3323,7 +4371,7 @@ async fn open_tunnel_with_owner(
     let open = ctx.client.post(&open_url);
     let resp = if matches!(ctx.wire, WireApi::V2 { .. }) {
         let deadline = tokio::time::Instant::now() + ctx.retry_window;
-        let mut attempt = 0;
+        let mut attempt = 0u32;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -3336,8 +4384,30 @@ async fn open_tunnel_with_owner(
                 .send()
                 .await
             {
-                Ok(response) if response.status().is_success() => break response,
+                Ok(response) if response.status().is_success() => {
+                    diagnostic_event(
+                        "v2_open",
+                        serde_json::json!({
+                            "sid": sid,
+                            "route": target,
+                            "status": response.status().as_u16(),
+                            "attempts": attempt.saturating_add(1),
+                            "duration_us": operation_started.elapsed().as_micros(),
+                            "ok": true,
+                        }),
+                    );
+                    break response;
+                }
                 Ok(response) if retryable_status(response.status()) => {
+                    diagnostic_event(
+                        "v2_retry",
+                        serde_json::json!({
+                            "operation": "open",
+                            "sid": sid,
+                            "attempt": attempt,
+                            "status": response.status().as_u16(),
+                        }),
+                    );
                     let delay = v2_backoff(attempt);
                     V2_COUNTERS.retries.fetch_add(1, Relaxed);
                     attempt += 1;
@@ -3346,8 +4416,31 @@ async fn open_tunnel_with_owner(
                     }
                     tokio::time::sleep(delay).await;
                 }
-                Ok(response) => bail!("server refused v2 session: {}", response.status()),
+                Ok(response) => {
+                    diagnostic_event(
+                        "v2_open",
+                        serde_json::json!({
+                            "sid": sid,
+                            "route": target,
+                            "status": response.status().as_u16(),
+                            "attempts": attempt.saturating_add(1),
+                            "duration_us": operation_started.elapsed().as_micros(),
+                            "ok": false,
+                            "reason": "terminal_status",
+                        }),
+                    );
+                    bail!("server refused v2 session: {}", response.status())
+                }
                 Err(_) => {
+                    diagnostic_event(
+                        "v2_retry",
+                        serde_json::json!({
+                            "operation": "open",
+                            "sid": sid,
+                            "attempt": attempt,
+                            "reason": "request_error",
+                        }),
+                    );
                     let delay = v2_backoff(attempt);
                     V2_COUNTERS.retries.fetch_add(1, Relaxed);
                     attempt += 1;
@@ -3553,6 +4646,7 @@ impl V2RetryWindow {
 }
 
 async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Result<()> {
+    let operation_started = Instant::now();
     let mut retries = V2RetryWindow::new(ctx.retry_window);
     let url = format!(
         "{}{}?s={}&seq={}",
@@ -3593,14 +4687,62 @@ async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Resul
                     Err(error) => return Err(error).context("malformed v2 upstream ack"),
                 };
                 if frames == [V2Frame::Ack(seq)] {
+                    diagnostic_event(
+                        "v2_send",
+                        serde_json::json!({
+                            "sid": sid,
+                            "seq": seq,
+                            "request_bytes": body.len(),
+                            "response_bytes": bytes.len(),
+                            "attempts": retries.attempt.saturating_add(1),
+                            "ack_wait_us": operation_started.elapsed().as_micros(),
+                            "ok": true,
+                        }),
+                    );
                     return Ok(());
                 }
                 bail!("missing or mismatched v2 upstream ack");
             }
             Ok(resp) if !retryable_status(resp.status()) => {
+                diagnostic_event(
+                    "v2_send",
+                    serde_json::json!({
+                        "sid": sid,
+                        "seq": seq,
+                        "request_bytes": body.len(),
+                        "status": resp.status().as_u16(),
+                        "attempts": retries.attempt.saturating_add(1),
+                        "ack_wait_us": operation_started.elapsed().as_micros(),
+                        "ok": false,
+                        "reason": "terminal_status",
+                    }),
+                );
                 bail!("v2 upstream terminal status {}", resp.status())
             }
-            Ok(_) | Err(_) => {
+            Ok(resp) => {
+                diagnostic_event(
+                    "v2_retry",
+                    serde_json::json!({
+                        "operation": "send",
+                        "sid": sid,
+                        "seq": seq,
+                        "attempt": retries.attempt,
+                        "status": resp.status().as_u16(),
+                    }),
+                );
+                retries.retry().await.context("v2 upstream retry window")?;
+            }
+            Err(_) => {
+                diagnostic_event(
+                    "v2_retry",
+                    serde_json::json!({
+                        "operation": "send",
+                        "sid": sid,
+                        "seq": seq,
+                        "attempt": retries.attempt,
+                        "reason": "request_error",
+                    }),
+                );
                 retries.retry().await.context("v2 upstream retry window")?;
             }
         }
@@ -3608,6 +4750,7 @@ async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Resul
 }
 
 async fn v2_get_frames(ctx: &TunnelCtx, sid: &str, seq: u64) -> Result<Vec<V2Frame>> {
+    let operation_started = Instant::now();
     let mut retries = V2RetryWindow::new(ctx.retry_window);
     let url = format!(
         "{}{}?s={}&seq={}",
@@ -3663,12 +4806,64 @@ async fn v2_get_frames(ctx: &TunnelCtx, sid: &str, seq: u64) -> Result<Vec<V2Fra
                         _ => bail!("invalid v2 downstream frames"),
                     }
                 }
+                diagnostic_event(
+                    "v2_recv",
+                    serde_json::json!({
+                        "sid": sid,
+                        "seq": seq,
+                        "response_bytes": bytes.len(),
+                        "frames": frames.len(),
+                        "data_bytes": frames.iter().filter_map(|frame| match frame { V2Frame::Data(data) => Some(data.len()), _ => None }).sum::<usize>(),
+                        "empty": frames.len() == 1,
+                        "attempts": retries.attempt.saturating_add(1),
+                        "wait_us": operation_started.elapsed().as_micros(),
+                        "ok": true,
+                    }),
+                );
                 return Ok(frames);
             }
             Ok(resp) if !retryable_status(resp.status()) => {
+                diagnostic_event(
+                    "v2_recv",
+                    serde_json::json!({
+                        "sid": sid,
+                        "seq": seq,
+                        "status": resp.status().as_u16(),
+                        "attempts": retries.attempt.saturating_add(1),
+                        "wait_us": operation_started.elapsed().as_micros(),
+                        "ok": false,
+                        "reason": "terminal_status",
+                    }),
+                );
                 bail!("v2 downstream terminal status {}", resp.status())
             }
-            Ok(_) | Err(_) => {
+            Ok(resp) => {
+                diagnostic_event(
+                    "v2_retry",
+                    serde_json::json!({
+                        "operation": "recv",
+                        "sid": sid,
+                        "seq": seq,
+                        "attempt": retries.attempt,
+                        "status": resp.status().as_u16(),
+                    }),
+                );
+                retries
+                    .retry()
+                    .await
+                    .context("v2 downstream retry window")?;
+            }
+            Err(_) => {
+                diagnostic_event(
+                    "v2_retry",
+                    serde_json::json!({
+                        "operation": "recv",
+                        "sid": sid,
+                        "seq": seq,
+                        "attempt": retries.attempt,
+                        "reason": "request_error",
+                    }),
+                );
                 retries
                     .retry()
                     .await
@@ -4016,6 +5211,111 @@ async fn collect_reverse_response(resp: reqwest::Response) -> Result<Bytes> {
     Ok(bytes)
 }
 
+pub async fn run_reverse_diagnostic(
+    cfg: &ClientConfig,
+    endpoint_id: &str,
+    run_id: &str,
+    passes: u8,
+) -> Result<()> {
+    if !matches!(cfg.wire, WireApi::V2 { .. }) || cfg.mode != Mode::Batch {
+        bail!("reverse diagnostics require wire api v2 and batch mode");
+    }
+    validate_reverse_id(endpoint_id, "endpoint id").map_err(anyhow::Error::msg)?;
+    validate_reverse_id(run_id, "run id").map_err(anyhow::Error::msg)?;
+    if !(1..=3).contains(&passes) {
+        bail!("diagnostic passes must be between 1 and 3");
+    }
+    let ctx = ctx_from(cfg)?;
+    let submit_url = format!("{}/api/v2/reverse/diagnostics/run", ctx.server);
+    let request = serde_json::json!({
+        "endpoint_id": endpoint_id,
+        "run_id": run_id,
+        "passes": passes,
+    });
+    let request_body = serde_json::to_vec(&request)?;
+    let mut submitted = false;
+    for attempt in 0..5u32 {
+        let response = ctx
+            .client
+            .post(&submit_url)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(request_body.clone())
+            .timeout(ctx.timeout)
+            .send()
+            .await;
+        match response {
+            Ok(response)
+                if response.status() == StatusCode::ACCEPTED
+                    || response.status() == StatusCode::CONFLICT =>
+            {
+                submitted = true;
+                break;
+            }
+            Ok(response) if retryable_status(response.status()) => {}
+            Ok(response) => bail!("reverse diagnostic submit status {}", response.status()),
+            Err(_) => {}
+        }
+        tokio::time::sleep(v2_backoff(attempt)).await;
+    }
+    if !submitted {
+        bail!("submitting reverse diagnostic run failed after retries");
+    }
+
+    let status_url = format!(
+        "{}/api/v2/reverse/diagnostics/status?run={run_id}",
+        ctx.server
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("reverse diagnostic status deadline elapsed");
+        }
+        let response = match ctx
+            .client
+            .get(&status_url)
+            .timeout(ctx.timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        if retryable_status(response.status()) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        if !response.status().is_success() {
+            bail!("reverse diagnostic status {}", response.status());
+        }
+        let body = match collect_reverse_response(response).await {
+            Ok(body) => body,
+            Err(error) if !reverse_response_error_is_terminal(&error) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let job: serde_json::Value =
+            serde_json::from_slice(&body).context("decoding reverse diagnostic status")?;
+        match job.get("status").and_then(serde_json::Value::as_str) {
+            Some("complete" | "error") => {
+                println!("{}", serde_json::to_string_pretty(&job)?);
+                return if job.get("status").and_then(serde_json::Value::as_str) == Some("complete")
+                {
+                    Ok(())
+                } else {
+                    bail!("reverse diagnostic run failed")
+                };
+            }
+            Some("running") => tokio::time::sleep(Duration::from_secs(2)).await,
+            _ => bail!("reverse diagnostic returned an invalid state"),
+        }
+    }
+}
+
 fn reverse_response_error_is_terminal(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("missing Content-Length") || message.contains("exceeds batch limit")
@@ -4166,17 +5466,84 @@ async fn handle_reverse_connection(
     conn_id: String,
     peer: String,
 ) -> Result<()> {
-    let tcp = tokio::time::timeout(ctx.timeout, TcpStream::connect(&mapping.dial_target))
+    let dial_started = Instant::now();
+    let tcp = match tokio::time::timeout(ctx.timeout, TcpStream::connect(&mapping.dial_target))
         .await
-        .with_context(|| format!("dial {} timed out", mapping.dial_target))?
-        .with_context(|| format!("dial {} failed", mapping.dial_target))?;
+    {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(error)) => {
+            diagnostic_event(
+                "reverse_target_dial",
+                serde_json::json!({
+                    "endpoint_id": mapping.endpoint_id,
+                    "conn_id": conn_id,
+                    "ok": false,
+                    "reason": "connect_error",
+                    "duration_us": dial_started.elapsed().as_micros(),
+                }),
+            );
+            return Err(error).with_context(|| format!("dial {} failed", mapping.dial_target));
+        }
+        Err(error) => {
+            diagnostic_event(
+                "reverse_target_dial",
+                serde_json::json!({
+                    "endpoint_id": mapping.endpoint_id,
+                    "conn_id": conn_id,
+                    "ok": false,
+                    "reason": "timeout",
+                    "duration_us": dial_started.elapsed().as_micros(),
+                }),
+            );
+            return Err(error).with_context(|| format!("dial {} timed out", mapping.dial_target));
+        }
+    };
     let sid = new_sid();
+    diagnostic_event(
+        "reverse_target_dial",
+        serde_json::json!({
+            "endpoint_id": mapping.endpoint_id,
+            "conn_id": conn_id,
+            "sid": sid,
+            "peer": peer,
+            "local_addr": tcp.local_addr().ok().map(|addr| addr.to_string()),
+            "ok": true,
+            "duration_us": dial_started.elapsed().as_micros(),
+        }),
+    );
     let route = format!("attach:{}:{conn_id}", mapping.endpoint_id);
     log::debug!(
         "reverse endpoint {} attaching {peer} as session {sid}",
         mapping.endpoint_id
     );
-    let (sender, receiver) = open_tunnel_with_owner(ctx, sid, &route, Some(&owner_id)).await?;
+    let open_started = Instant::now();
+    let (sender, receiver) =
+        match open_tunnel_with_owner(ctx, sid.clone(), &route, Some(&owner_id)).await {
+            Ok(tunnel) => tunnel,
+            Err(error) => {
+                diagnostic_event(
+                    "reverse_open",
+                    serde_json::json!({
+                        "endpoint_id": mapping.endpoint_id,
+                        "conn_id": conn_id,
+                        "sid": sid,
+                        "ok": false,
+                        "duration_us": open_started.elapsed().as_micros(),
+                    }),
+                );
+                return Err(error);
+            }
+        };
+    diagnostic_event(
+        "reverse_open",
+        serde_json::json!({
+            "endpoint_id": mapping.endpoint_id,
+            "conn_id": conn_id,
+            "sid": sid,
+            "ok": true,
+            "duration_us": open_started.elapsed().as_micros(),
+        }),
+    );
     bridge_tcp(tcp, sender, receiver).await;
     Ok(())
 }
@@ -4382,12 +5749,25 @@ async fn handle_tcp_connection(tcp: TcpStream, target: &str, ctx: Arc<TunnelCtx>
 
 async fn bridge_tcp(tcp: TcpStream, mut sender: TunnelSender, mut receiver: TunnelReceiver) {
     let (mut rd, mut wr) = tcp.into_split();
+    let up_sid = sender.sid.clone();
+    let down_sid = up_sid.clone();
     let up = async move {
         let mut buf = vec![0u8; READ_BUF];
+        let mut first = true;
         let clean_eof = loop {
             match rd.read(&mut buf).await {
                 Ok(0) => break true,
                 Ok(n) => {
+                    diagnostic_event(
+                        "tcp_read",
+                        serde_json::json!({
+                            "sid": up_sid,
+                            "direction": "up",
+                            "bytes": n,
+                            "first": first,
+                        }),
+                    );
+                    first = false;
                     if let Err(error) = sender.send(Bytes::copy_from_slice(&buf[..n])).await {
                         log::debug!("TCP mapping upstream ended: {error}");
                         break false;
@@ -4413,7 +5793,18 @@ async fn bridge_tcp(tcp: TcpStream, mut sender: TunnelSender, mut receiver: Tunn
         clean_eof
     };
     let down = async move {
+        let mut first = true;
         while let Some(data) = receiver.recv().await {
+            diagnostic_event(
+                "tcp_write",
+                serde_json::json!({
+                    "sid": down_sid,
+                    "direction": "down",
+                    "bytes": data.len(),
+                    "first": first,
+                }),
+            );
+            first = false;
             if let Err(error) = wr.write_all(&data).await {
                 log::debug!("TCP mapping local write failed: {error}");
                 break;
@@ -5474,6 +6865,7 @@ mod tests {
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            reverse_diagnostics: None,
         };
 
         let response = handle_down_batch(session, &opts).await;
@@ -5583,6 +6975,7 @@ mod tests {
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            reverse_diagnostics: None,
         };
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy.local_addr().unwrap().port();
@@ -5646,6 +7039,7 @@ mod tests {
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            reverse_diagnostics: None,
         };
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy.local_addr().unwrap().port();
@@ -5711,6 +7105,7 @@ mod tests {
             endpoints: HashMap::from([(
                 "probe".to_owned(),
                 ReverseEndpoint {
+                    bind: "127.0.0.1:13129".parse().unwrap(),
                     owner: None,
                     cursor: 0,
                     conns: HashMap::new(),
@@ -5752,6 +7147,7 @@ mod tests {
         let mut client = client.await.unwrap().unwrap();
         let conn_id = "0123456789abcdef0123456789abcdef".to_owned();
         let mut endpoint = ReverseEndpoint {
+            bind: address,
             owner: Some(ReverseOwner {
                 id: "owner-one".to_owned(),
                 last_seen: Instant::now(),

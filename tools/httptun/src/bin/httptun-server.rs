@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use httptun::{run_server, telemost_preset_routes, Mode, ReverseEndpointConfig, ServerConfig};
+use httptun::{
+    enable_diagnostics, run_server, telemost_preset_routes, Mode, ReverseEndpointConfig,
+    ServerConfig,
+};
 
 /// HTTP-streaming tunnel server: bridges each fixed route to a TCP or UDP target
 /// or to a built-in echo responder.
@@ -59,6 +62,10 @@ struct Args {
     #[arg(long, value_name = "ENDPOINT=LOOPBACK:PORT")]
     reverse: Vec<ReverseEndpointConfig>,
 
+    /// Enable the authenticated reverse diagnostic control endpoint.
+    #[arg(long)]
+    reverse_diagnostics: bool,
+
     /// Maximum concurrent sessions before /api/v1/session/open returns 429.
     #[arg(long, default_value_t = 256)]
     max_sessions: usize,
@@ -70,12 +77,19 @@ struct Args {
     /// -v debug, -vv trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Write sanitized transport events as JSON Lines.
+    #[arg(long, value_name = "PATH")]
+    diagnostics_jsonl: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     httptun_init_log(args.verbose);
+    if let Some(path) = args.diagnostics_jsonl.as_deref() {
+        enable_diagnostics(path, "server").await?;
+    }
 
     let mut sans = args.sans.clone();
     for d in ["localhost", "127.0.0.1", "201.24.52.171"] {
@@ -99,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         max_sessions: args.max_sessions,
         routes: telemost_preset_routes(&args.relay_host),
         reverse: args.reverse,
+        reverse_diagnostics: args.reverse_diagnostics,
     };
     run_server(cfg).await
 }

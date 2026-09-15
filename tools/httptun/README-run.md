@@ -242,6 +242,19 @@ Kerberos и px, поддерживает `--status`, `--stop`, `--diagnostic` и
 делает curl через px/MWG и запускает с VPS 10 последовательных и 6 параллельных
 запросов через reverse-порт. Скрипт не выводит bearer token или тела ответов.
 
+Расширенный baseline-пакет находится в `tools/httptun/diagnostics/`. Он добавляет
+структурированные JSONL-метрики, отдельную проверяемую reverse-цель, application
+suite 1/8/32 со стороны VPS без SSH с Mac, локальную матрицу whole-body
+буферизации 50/250/1000 мс и единые JSON/CSV/Markdown-отчёты. Запуск под VPN:
+
+```bash
+tools/httptun/diagnostics/run-corp-diagnostics.sh
+```
+
+На VPS control endpoint включается только явным `--reverse-diagnostics`, требует
+настроенный bearer token и работает лишь с заранее заданным loopback endpoint.
+Подробности и Windows Edge/PAC helper — в `tools/httptun/diagnostics/README.md`.
+
 Windows не запускает reverse-клиент. Скрипт
 `tools/httptun/windows-ssh-forward.ps1` проверяет доступность VPS:22 и держит
 SSH-проброс `127.0.0.1:13128 -> VPS 127.0.0.1:13129`; настройка браузера остаётся

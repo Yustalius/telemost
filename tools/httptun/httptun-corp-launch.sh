@@ -12,7 +12,7 @@
 
 set -u
 
-STATE_DIR="$HOME/.telemost-vpn"
+STATE_DIR="${HTTPTUN_STATE_DIR:-$HOME/.telemost-vpn}"
 HTTPTUN_BIN="$STATE_DIR/httptun-client"
 TOKEN_FILE="$STATE_DIR/httptun-token"
 OWNER_FILE="$STATE_DIR/reverse-owner-id"
@@ -23,11 +23,14 @@ PX_BIN="$HOME/.local/bin/px"
 PX_PORT=3129
 PX_PID="$STATE_DIR/httptun-reverse-px.pid"
 PX_LOG="$STATE_DIR/httptun-reverse-px.log"
-UPSTREAM_PROXY="ms-mwgvpn.vimpelcom.ru:9090"
-CORP_NOPROXY="retest-agent.apps.yd-m6-kt66.vimpelcom.ru"
-SERVER_URL="https://ya-telemost.site"
-ENDPOINT_ID="probe"
-CORP_URL="https://retest-agent.apps.yd-m6-kt66.vimpelcom.ru/"
+UPSTREAM_PROXY="${HTTPTUN_UPSTREAM_PROXY:-ms-mwgvpn.vimpelcom.ru:9090}"
+CORP_NOPROXY="${HTTPTUN_CORP_NOPROXY:-beeline.ru,vimpelcom.ru}"
+SERVER_URL="${HTTPTUN_SERVER_URL:-https://ya-telemost.site}"
+ENDPOINT_ID="${HTTPTUN_REVERSE_ENDPOINT:-probe}"
+CORP_URL="${HTTPTUN_CORP_URL:-https://retest-agent.apps.yd-m6-kt66.vimpelcom.ru/}"
+DIAGNOSTIC_ENDPOINT="${HTTPTUN_DIAGNOSTIC_ENDPOINT:-}"
+DIAGNOSTIC_TARGET="${HTTPTUN_DIAGNOSTIC_TARGET:-}"
+DIAGNOSTICS_JSONL="${HTTPTUN_DIAGNOSTICS_JSONL:-}"
 VPN_CLI="/opt/cisco/anyconnect/bin/vpn"
 
 ACTION=start
@@ -298,15 +301,29 @@ fi
 stop_client
 : >"$HTTPTUN_LOG"
 verbosity="-v"
-[ "$DIAGNOSTIC" -eq 1 ] && verbosity="-vv"
+log_filter="httptun=debug"
+if [ "$DIAGNOSTIC" -eq 1 ]; then
+    verbosity="-vv"
+    log_filter="httptun=trace"
+fi
 info "запускаю reverse httptun через dedicated px:$PX_PORT"
 # Explicit --proxy keeps httptun-api traffic (claim/accept for ya-telemost.site)
 # pinned to the dedicated px regardless of inherited HTTP_PROXY/ALL_PROXY.
 # The reverse target dial is a raw TCP connect to the same dedicated px on
 # 127.0.0.1:$PX_PORT; its --noproxy sends the corp app directly via the VPN.
+reverse_args=(--reverse-map "$ENDPOINT_ID->127.0.0.1:$PX_PORT")
+if [ -n "$DIAGNOSTIC_ENDPOINT" ] || [ -n "$DIAGNOSTIC_TARGET" ]; then
+    [ -n "$DIAGNOSTIC_ENDPOINT" ] && [ -n "$DIAGNOSTIC_TARGET" ] \
+        || die "HTTPTUN_DIAGNOSTIC_ENDPOINT и HTTPTUN_DIAGNOSTIC_TARGET задаются вместе"
+    reverse_args+=(--reverse-map "$DIAGNOSTIC_ENDPOINT->$DIAGNOSTIC_TARGET")
+fi
+diagnostic_args=()
+[ -z "$DIAGNOSTICS_JSONL" ] || diagnostic_args=(--diagnostics-jsonl "$DIAGNOSTICS_JSONL")
+
 HTTPS_PROXY="http://127.0.0.1:$PX_PORT" \
 ALL_PROXY="http://127.0.0.1:$PX_PORT" \
 NO_PROXY="127.0.0.1,localhost" \
+RUST_LOG="$log_filter" \
 nohup "$HTTPTUN_BIN" \
     --server "$SERVER_URL" \
     --wire-api v2 \
@@ -314,9 +331,10 @@ nohup "$HTTPTUN_BIN" \
     --proxy "http://127.0.0.1:$PX_PORT" \
     --token-file "$TOKEN_FILE" \
     --reverse-owner-file "$OWNER_FILE" \
-    --reverse-map "$ENDPOINT_ID->127.0.0.1:$PX_PORT" \
+    "${reverse_args[@]}" \
     --timeout-sec 30 \
     --retry-window-sec 60 \
+    "${diagnostic_args[@]}" \
     "$verbosity" >>"$HTTPTUN_LOG" 2>&1 &
 client=$!
 printf '%s\n' "$client" >"$PID_FILE"

@@ -492,6 +492,7 @@ fn base_server_cfg(echo_all: bool) -> ServerConfig {
         max_sessions: 256,
         routes: Vec::new(),
         reverse: Vec::new(),
+        reverse_diagnostics: false,
     }
 }
 

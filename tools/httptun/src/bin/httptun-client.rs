@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use httptun::{
-    run_mappings, run_reverse, selftest_ping, telemost_preset_maps_v1, throughput, tls_probe,
-    ClientConfig, Mode, PortMap, ProxyOpt, ReverseMap, WireApi,
+    enable_diagnostics, run_mappings, run_reverse, run_reverse_diagnostic, selftest_ping,
+    telemost_preset_maps_v1, throughput, tls_probe, ClientConfig, Mode, PortMap, ProxyOpt,
+    ReverseMap, WireApi,
 };
 
 /// Fixed local TCP/UDP listeners tunneled to an httptun-server over ordinary HTTP.
@@ -30,6 +31,23 @@ struct Args {
     /// File containing the persistent reverse owner id.
     #[arg(long, value_name = "PATH", requires = "reverse_mappings")]
     reverse_owner_file: Option<PathBuf>,
+
+    /// Run the server-side baseline suite through a claimed reverse endpoint,
+    /// print its final JSON report, and exit.
+    #[arg(
+        long,
+        value_name = "ENDPOINT",
+        conflicts_with_all = ["mappings", "reverse_mappings", "telemost_preset", "tls_probe", "selftest_ping", "throughput"]
+    )]
+    reverse_diagnostic_run: Option<String>,
+
+    /// Stable identifier used to correlate one diagnostic package.
+    #[arg(long, value_name = "ID", requires = "reverse_diagnostic_run")]
+    diagnostic_run_id: Option<String>,
+
+    /// Number of complete baseline passes.
+    #[arg(long, default_value_t = 3, requires = "reverse_diagnostic_run")]
+    diagnostic_passes: u8,
 
     /// Add telemost's four port mappings and use this host as the HTTPS server.
     #[arg(long, value_name = "VPS_HOST")]
@@ -80,6 +98,10 @@ struct Args {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Write sanitized transport events as JSON Lines.
+    #[arg(long, value_name = "PATH")]
+    diagnostics_jsonl: Option<PathBuf>,
+
     // ----- measurement hooks (run once and exit, printing JSON) -----
     /// Probe TLS validation to <URL> with the tunnel's exact stack (native root
     /// store, honoring --danger-accept-invalid-cert and the env proxy). Prints
@@ -122,6 +144,9 @@ enum WireChoice {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     httptun_init_log(args.verbose);
+    if let Some(path) = args.diagnostics_jsonl.as_deref() {
+        enable_diagnostics(path, "client").await?;
+    }
 
     let token = match args.token_file.as_deref() {
         Some(path) => Some(read_one_line(path, "token")?),
@@ -168,7 +193,13 @@ async fn main() -> anyhow::Result<()> {
         wire,
     };
 
-    if !args.reverse_mappings.is_empty() {
+    if let Some(endpoint) = args.reverse_diagnostic_run.as_deref() {
+        let run_id = args
+            .diagnostic_run_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--diagnostic-run-id is required"))?;
+        run_reverse_diagnostic(&cfg, endpoint, run_id, args.diagnostic_passes).await
+    } else if !args.reverse_mappings.is_empty() {
         run_reverse(
             cfg,
             args.reverse_mappings,
