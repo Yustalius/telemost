@@ -223,6 +223,10 @@ httptun-client --server https://ya-telemost.site \
 Kerberos и px, поддерживает `--status`, `--stop`, `--diagnostic` и выполняет
 необязательную сквозную проверку с VPS.
 
+После запуска канала `tools/httptun/httptun-corp-diagnostic.sh` проверяет Mac,
+делает curl через px/MWG и запускает с VPS 10 последовательных и 6 параллельных
+запросов через reverse-порт. Скрипт не выводит bearer token или тела ответов.
+
 Windows не запускает reverse-клиент. Скрипт
 `tools/httptun/windows-ssh-forward.ps1` проверяет доступность VPS:22 и держит
 SSH-проброс `127.0.0.1:13128 -> VPS 127.0.0.1:13129`; настройка браузера остаётся
