@@ -33,6 +33,8 @@ wait_ready() {
 [ -f "$UNIT" ] || { printf '[FAIL] unit not found: %s\n' "$UNIT" >&2; exit 1; }
 "$SOURCE_BIN" --help | grep -q -- '--reverse-diagnostics' \
     || { printf '[FAIL] binary has no reverse diagnostic support\n' >&2; exit 1; }
+"$SOURCE_BIN" --help | grep -q -- '--experimental-reverse-batches' \
+    || { printf '[FAIL] binary has no profile B support\n' >&2; exit 1; }
 
 cp -p "$TARGET_BIN" "$BACKUP_BIN"
 cp -p "$UNIT" "$BACKUP_UNIT"
@@ -52,6 +54,7 @@ install -m 0755 "$SOURCE_BIN" "$TARGET_BIN.diagnostic-new"
 mv "$TARGET_BIN.diagnostic-new" "$TARGET_BIN"
 cmp -s "$SOURCE_BIN" "$TARGET_BIN"
 "$TARGET_BIN" --help | grep -q -- '--reverse-diagnostics'
+"$TARGET_BIN" --help | grep -q -- '--experimental-reverse-batches'
 
 systemctl restart httptun-server
 wait_ready 0
@@ -61,6 +64,9 @@ if ! grep -q '^StateDirectory=httptun-server$' "$UNIT"; then
 fi
 if ! grep -q -- '--reverse diag=127.0.0.1:13130' "$UNIT"; then
     sed -i '/^ExecStart=/s|$| --reverse diag=127.0.0.1:13130 --reverse-diagnostics --diagnostics-jsonl /var/lib/httptun-server/diagnostics.jsonl|' "$UNIT"
+fi
+if ! grep -q -- '--experimental-reverse-batches' "$UNIT"; then
+    sed -i '/^ExecStart=/s|$| --experimental-reverse-batches|' "$UNIT"
 fi
 
 systemctl daemon-reload

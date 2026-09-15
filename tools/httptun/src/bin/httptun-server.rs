@@ -66,6 +66,10 @@ struct Args {
     #[arg(long)]
     reverse_diagnostics: bool,
 
+    /// Enable opt-in profile B batch sizes on reverse sessions.
+    #[arg(long)]
+    experimental_reverse_batches: bool,
+
     /// Maximum concurrent sessions before /api/v1/session/open returns 429.
     #[arg(long, default_value_t = 256)]
     max_sessions: usize,
@@ -114,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         routes: telemost_preset_routes(&args.relay_host),
         reverse: args.reverse,
         reverse_diagnostics: args.reverse_diagnostics,
+        experimental_reverse_batches: args.experimental_reverse_batches,
     };
     run_server(cfg).await
 }

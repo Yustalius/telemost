@@ -493,6 +493,7 @@ fn base_server_cfg(echo_all: bool) -> ServerConfig {
         routes: Vec::new(),
         reverse: Vec::new(),
         reverse_diagnostics: false,
+        experimental_reverse_batches: false,
     }
 }
 
@@ -686,6 +687,7 @@ fn client_config(server_port: u16, mode: Mode, proxy: ProxyOpt) -> ClientConfig 
         keepalive: Duration::from_secs(5),
         timeout: Duration::from_secs(5),
         retry_window: Duration::from_secs(60),
+        experimental_batch_bytes: None,
         wire: WireApi::V1 { token: None },
     }
 }
@@ -1027,6 +1029,7 @@ fn v1_client_config(server_port: u16, mode: Mode, token: Option<String>) -> Clie
         keepalive: Duration::from_secs(5),
         timeout: Duration::from_secs(5),
         retry_window: Duration::from_secs(60),
+        experimental_batch_bytes: None,
         wire: WireApi::V1 { token },
     }
 }
@@ -1040,6 +1043,7 @@ fn v2_client_config(server_port: u16) -> ClientConfig {
         keepalive: Duration::from_secs(5),
         timeout: Duration::from_secs(5),
         retry_window: Duration::from_secs(60),
+        experimental_batch_bytes: None,
         wire: WireApi::V2 { token: None },
     }
 }
@@ -1280,6 +1284,28 @@ async fn v2_open_is_idempotent_and_rejects_route_and_version_conflicts() {
             .status(),
         StatusCode::CONFLICT
     );
+    assert_eq!(
+        client
+            .post(format!(
+                "{base}/api/v2/session/open?s=invalid-batch&r=tcp&batch_bytes=32768"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .post(format!(
+                "{base}/api/v2/session/open?s=one&r=tcp&batch_bytes=65536"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let v1 = {
@@ -1516,6 +1542,7 @@ async fn v2_mismatched_ack_closes_local_tcp_and_stops_downstream_polling() {
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(1),
         retry_window: Duration::from_secs(1),
+        experimental_batch_bytes: None,
         wire: WireApi::V2 { token: None },
     };
     tokio::spawn(async move {
@@ -1576,6 +1603,7 @@ async fn v2_front_cuts_committed_upstream_response_and_retry_writes_target_once(
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(2),
         retry_window: Duration::from_secs(5),
+        experimental_batch_bytes: None,
         wire: WireApi::V2 {
             token: Some("proxy-token".into()),
         },
@@ -1653,6 +1681,7 @@ async fn v2_retries_lost_successful_open_without_a_second_target_dial() {
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(2),
         retry_window: Duration::from_secs(5),
+        experimental_batch_bytes: None,
         wire: WireApi::V2 { token: None },
     };
     tokio::spawn(async move {
@@ -1714,6 +1743,7 @@ async fn v2_front_cuts_cached_downstream_response_and_replays_local_delivery_onc
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(3),
         retry_window: Duration::from_secs(5),
+        experimental_batch_bytes: None,
         wire: WireApi::V2 {
             token: Some("proxy-token".into()),
         },
@@ -1922,6 +1952,17 @@ async fn reverse_roundtrip(port: u16, payload: &'static [u8]) {
     assert_eq!(got, payload);
 }
 
+async fn reverse_roundtrip_owned(port: u16, payload: Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(&payload).await.unwrap();
+    let mut got = vec![0; payload.len()];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .expect("reverse profile B response timed out")
+        .unwrap();
+    assert_eq!(got, payload);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reverse_api_is_authenticated_cursor_safe_and_one_shot() {
     let reverse_port = reserve_tcp_port().await;
@@ -2084,4 +2125,45 @@ async fn reverse_client_roundtrips_parallel_connections_and_reclaims_after_resta
     assert_eq!(response.status(), StatusCode::OK);
     reverse_roundtrip(reverse_port, b"after-restart").await;
     second_client.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_profile_b_roundtrips_across_all_batch_limits() {
+    for kib in [64usize, 128, 256] {
+        let target = spawn_echo_target().await;
+        let reverse_port = reserve_tcp_port().await;
+        let mut server_cfg = base_server_cfg(false);
+        server_cfg.auth_token = Some("reverse-secret".into());
+        server_cfg.experimental_reverse_batches = true;
+        server_cfg.reverse = vec![ReverseEndpointConfig {
+            id: "profile-b".into(),
+            bind: format!("127.0.0.1:{reverse_port}").parse().unwrap(),
+        }];
+        let server_port = spawn_server_with(server_cfg).await;
+        let mut client_cfg = v2_client_config(server_port);
+        client_cfg.timeout = Duration::from_secs(25);
+        client_cfg.experimental_batch_bytes = Some(kib * 1024);
+        client_cfg.wire = WireApi::V2 {
+            token: Some("reverse-secret".into()),
+        };
+        let owner = format!("profile-b-{kib}");
+        let client = tokio::spawn(run_reverse(
+            client_cfg,
+            vec![ReverseMap {
+                endpoint_id: "profile-b".into(),
+                dial_target: target.to_string(),
+            }],
+            owner.clone(),
+        ));
+        let http = v2_http_client();
+        let base = format!("https://127.0.0.1:{server_port}");
+        let response =
+            claim_reverse_until_ready(&http, &base, "profile-b", &owner, "reverse-secret").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload = (0..300 * 1024).map(|index| (index % 251) as u8).collect();
+        reverse_roundtrip_owned(reverse_port, payload).await;
+        client.abort();
+        let _ = client.await;
+    }
 }

@@ -45,6 +45,7 @@ const CHAN_CAP: usize = 64;
 const READ_BUF: usize = 32 * 1024;
 const MAX_BATCH: usize = 256 * 1024;
 const MAX_V2_QUEUE: usize = MAX_BATCH - (u16::MAX as usize + 1);
+const EXPERIMENTAL_BATCH_BYTES: [usize; 3] = [64 * 1024, 128 * 1024, MAX_BATCH];
 const SESSION_IDLE: Duration = Duration::from_secs(300);
 const OPENING_IDLE: Duration = Duration::from_secs(60);
 const LOCAL_BIND_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -319,6 +320,8 @@ pub struct ServerConfig {
     pub reverse: Vec<ReverseEndpointConfig>,
     /// Enable the authenticated, bounded reverse diagnostic runner.
     pub reverse_diagnostics: bool,
+    /// Accept opt-in profile B batch limits on reverse sessions.
+    pub experimental_reverse_batches: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +334,8 @@ pub struct ClientConfig {
     pub timeout: Duration,
     /// Maximum total time spent retrying one v2 logical operation.
     pub retry_window: Duration,
+    /// Opt-in profile B body limit. `None` preserves the baseline v2 behavior.
+    pub experimental_batch_bytes: Option<usize>,
     pub wire: WireApi,
 }
 
@@ -815,8 +820,14 @@ type ReverseDiagnosticJobs = Arc<tokio::sync::Mutex<HashMap<String, ReverseDiagn
 struct ReverseDiagnosticRequest {
     endpoint_id: String,
     run_id: String,
+    #[serde(default = "default_diagnostic_profile")]
+    profile: String,
     #[serde(default = "default_diagnostic_passes")]
     passes: u8,
+}
+
+fn default_diagnostic_profile() -> String {
+    "A-v2-baseline".to_owned()
 }
 
 fn default_diagnostic_passes() -> u8 {
@@ -826,7 +837,7 @@ fn default_diagnostic_passes() -> u8 {
 #[derive(Clone, Debug, serde::Serialize)]
 struct ReverseDiagnosticJob {
     schema: u8,
-    profile: &'static str,
+    profile: String,
     endpoint_id: String,
     run_id: String,
     status: &'static str,
@@ -979,6 +990,7 @@ enum V2Entry {
         route: String,
         generation: u64,
         tx: tokio::sync::mpsc::Sender<V2Command>,
+        batch_limit: usize,
         up_inflight: Arc<std::sync::Mutex<Option<(u64, Bytes)>>>,
         last: Arc<std::sync::Mutex<Instant>>,
     },
@@ -998,6 +1010,7 @@ struct ServerOpts {
     claims: VersionClaims,
     next_generation: Arc<AtomicU64>,
     reverse_diagnostics: Option<ReverseDiagnosticJobs>,
+    experimental_reverse_batches: bool,
 }
 
 #[derive(Clone)]
@@ -1338,6 +1351,10 @@ async fn handle_reverse_diagnostic_run(
     if validate_reverse_id(&request.endpoint_id, "endpoint id").is_err()
         || validate_reverse_id(&request.run_id, "run id").is_err()
         || request.run_id.len() > 64
+        || !matches!(
+            request.profile.as_str(),
+            "A-v2-baseline" | "B-batch-64" | "B-batch-128" | "B-batch-256"
+        )
         || !(1..=3).contains(&request.passes)
     {
         return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid request\n");
@@ -1374,7 +1391,7 @@ async fn handle_reverse_diagnostic_run(
             request.run_id.clone(),
             ReverseDiagnosticJob {
                 schema: 1,
-                profile: "A-v2-baseline",
+                profile: request.profile.clone(),
                 endpoint_id: request.endpoint_id.clone(),
                 run_id: request.run_id.clone(),
                 status: "running",
@@ -2035,6 +2052,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         reverse_diagnostics: cfg
             .reverse_diagnostics
             .then(|| Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
+        experimental_reverse_batches: cfg.experimental_reverse_batches,
     };
 
     spawn_sweeper(reg.clone(), opts.claims.clone());
@@ -2045,7 +2063,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
     }
 
     log::info!(
-        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, reverse={}, reverse_diagnostics={}, max_sessions={})",
+        "httptun-server listening on {:?} (mode hint={}, echo_all={}, auth={}, dashboard={}, routes={}, reverse={}, reverse_diagnostics={}, experimental_reverse_batches={}, max_sessions={})",
         local,
         cfg.mode.as_str(),
         cfg.echo_all,
@@ -2054,6 +2072,7 @@ pub async fn run_server_on(listener: TcpListener, cfg: ServerConfig) -> Result<(
         opts.routes.len(),
         cfg.reverse.len(),
         opts.reverse_diagnostics.is_some(),
+        opts.experimental_reverse_batches,
         opts.max_sessions,
     );
 
@@ -3329,6 +3348,8 @@ struct V2Actor {
     last_up: Option<(u64, Bytes, Bytes)>,
     cached_down: Option<(u64, Bytes)>,
     pending: Option<V2Pending>,
+    batch_limit: usize,
+    coalesce_ready: bool,
     upstream_closed: bool,
     eof: bool,
     terminal: bool,
@@ -3348,6 +3369,19 @@ async fn read_v2_body(mut body: Incoming) -> Result<Bytes> {
         out.extend_from_slice(&data);
     }
     Ok(out.freeze())
+}
+
+fn parse_experimental_batch_limit(req: &Request<Incoming>) -> Result<Option<usize>> {
+    let Some(value) = query_param(req.uri(), "batch_bytes") else {
+        return Ok(None);
+    };
+    let bytes = value
+        .parse::<usize>()
+        .context("invalid experimental batch size")?;
+    if !EXPERIMENTAL_BATCH_BYTES.contains(&bytes) {
+        bail!("unsupported experimental batch size");
+    }
+    Ok(Some(bytes))
 }
 
 fn v2_seq(req: &Request<Incoming>) -> Result<u64> {
@@ -3372,10 +3406,26 @@ async fn handle_open_v2(
         Some(r) => r,
         None => return text_resp(StatusCode::BAD_REQUEST, "missing route\n"),
     };
+    let experimental_batch_limit = match parse_experimental_batch_limit(&req) {
+        Ok(value) => value,
+        Err(_) => return text_resp(StatusCode::BAD_REQUEST, "invalid batch size\n"),
+    };
+    let batch_limit = experimental_batch_limit.unwrap_or(MAX_BATCH);
+    let claim_route = experimental_batch_limit
+        .map(|limit| format!("{route}\u{1f}batch_bytes={limit}"))
+        .unwrap_or_else(|| route.clone());
     let attach = match parse_reverse_attach(&route) {
         Ok(value) => value,
         Err(()) => return reverse_text_resp(StatusCode::BAD_REQUEST, "invalid attach route\n"),
     };
+    if experimental_batch_limit.is_some()
+        && (!opts.experimental_reverse_batches || attach.is_none())
+    {
+        return reverse_text_resp(
+            StatusCode::BAD_REQUEST,
+            "experimental reverse batch size is disabled\n",
+        );
+    }
     let reverse_owner = if attach.is_some() {
         match query_param(req.uri(), "owner")
             .filter(|value| validate_reverse_id(value, "owner id").is_ok())
@@ -3400,22 +3450,22 @@ async fn handle_open_v2(
             }
         }
     }
-    let (generation, permit) = match reserve_open(opts, &sid, &route, WireVersion::V2, false).await
-    {
-        OpenClaim::Ready => return text_resp(StatusCode::OK, ""),
-        OpenClaim::Opening => return text_resp(StatusCode::TOO_EARLY, "opening\n"),
-        OpenClaim::Conflict => {
-            return text_resp(StatusCode::CONFLICT, "session version or route conflict\n")
-        }
-        OpenClaim::Limited => {
-            return text_resp(StatusCode::TOO_MANY_REQUESTS, "session limit reached\n")
-        }
-        OpenClaim::Wait(_) => return text_resp(StatusCode::TOO_EARLY, "opening\n"),
-        OpenClaim::Owner {
-            generation,
-            admission,
-        } => (generation, admission),
-    };
+    let (generation, permit) =
+        match reserve_open(opts, &sid, &claim_route, WireVersion::V2, false).await {
+            OpenClaim::Ready => return text_resp(StatusCode::OK, ""),
+            OpenClaim::Opening => return text_resp(StatusCode::TOO_EARLY, "opening\n"),
+            OpenClaim::Conflict => {
+                return text_resp(StatusCode::CONFLICT, "session version or route conflict\n")
+            }
+            OpenClaim::Limited => {
+                return text_resp(StatusCode::TOO_MANY_REQUESTS, "session limit reached\n")
+            }
+            OpenClaim::Wait(_) => return text_resp(StatusCode::TOO_EARLY, "opening\n"),
+            OpenClaim::Owner {
+                generation,
+                admission,
+            } => (generation, admission),
+        };
     if let (Some(attach), Some(owner_id)) = (attach, reverse_owner) {
         let stream = match take_reverse_conn(reverse, &attach, &owner_id).await {
             ReverseAccess::Ready(Some(stream)) => stream,
@@ -3432,13 +3482,20 @@ async fn handle_open_v2(
                 return reverse_text_resp(StatusCode::CONFLICT, "endpoint not owned\n");
             }
         };
-        let tx = create_v2_actor_from_tcp(stream, permit, opts.poll_wait);
+        let tx = create_v2_actor_from_tcp(
+            stream,
+            permit,
+            opts.poll_wait,
+            batch_limit,
+            experimental_batch_limit.is_some(),
+        );
         reg.lock().await.insert(
             sid.clone(),
             V2Entry::Ready {
-                route,
+                route: claim_route,
                 generation,
                 tx,
+                batch_limit,
                 up_inflight: Arc::new(std::sync::Mutex::new(None)),
                 last: Arc::new(std::sync::Mutex::new(Instant::now())),
             },
@@ -3451,14 +3508,14 @@ async fn handle_open_v2(
         if let Some(entry) = guard.get(&sid) {
             Some(match entry {
                 V2Entry::Opening { route: old, .. } | V2Entry::Ready { route: old, .. } => {
-                    old == &route
+                    old == &claim_route
                 }
             })
         } else {
             guard.insert(
                 sid.clone(),
                 V2Entry::Opening {
-                    route: route.clone(),
+                    route: claim_route.clone(),
                     generation,
                     started: Instant::now(),
                 },
@@ -3477,7 +3534,15 @@ async fn handle_open_v2(
     let reg = reg.clone();
     let opts = opts.clone();
     tokio::spawn(async move {
-        match create_v2_actor(&route, &opts, permit).await {
+        match create_v2_actor(
+            &route,
+            &opts,
+            permit,
+            batch_limit,
+            experimental_batch_limit.is_some(),
+        )
+        .await
+        {
             Ok(tx) => {
                 let mut guard = reg.lock().await;
                 if matches!(guard.get(&sid), Some(V2Entry::Opening { generation: g, .. }) if *g == generation)
@@ -3485,9 +3550,10 @@ async fn handle_open_v2(
                     guard.insert(
                         sid.clone(),
                         V2Entry::Ready {
-                            route,
+                            route: claim_route,
                             generation,
                             tx,
+                            batch_limit,
                             up_inflight: Arc::new(std::sync::Mutex::new(None)),
                             last: Arc::new(std::sync::Mutex::new(Instant::now())),
                         },
@@ -3514,13 +3580,18 @@ async fn handle_open_v2(
 async fn v2_sender(
     reg: &V2Registry,
     sid: &str,
-) -> std::result::Result<tokio::sync::mpsc::Sender<V2Command>, StatusCode> {
+) -> std::result::Result<(tokio::sync::mpsc::Sender<V2Command>, usize), StatusCode> {
     match reg.lock().await.get(sid) {
-        Some(V2Entry::Ready { tx, last, .. }) => {
+        Some(V2Entry::Ready {
+            tx,
+            batch_limit,
+            last,
+            ..
+        }) => {
             if let Ok(mut time) = last.lock() {
                 *time = Instant::now();
             }
-            Ok(tx.clone())
+            Ok((tx.clone(), *batch_limit))
         }
         Some(V2Entry::Opening { .. }) => Err(StatusCode::TOO_EARLY),
         None => Err(StatusCode::NOT_FOUND),
@@ -3690,8 +3761,8 @@ async fn handle_down_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<Bo
         Ok(s) => s,
         Err(_) => return text_resp(StatusCode::BAD_REQUEST, "invalid sequence\n"),
     };
-    let tx = match v2_sender(reg, &sid).await {
-        Ok(tx) => tx,
+    let (tx, batch_limit) = match v2_sender(reg, &sid).await {
+        Ok(value) => value,
         Err(s) => return text_resp(s, "session unavailable\n"),
     };
     let (reply, rx) = tokio::sync::oneshot::channel();
@@ -3708,7 +3779,8 @@ async fn handle_down_v2(req: Request<Incoming>, reg: &V2Registry) -> Response<Bo
                     "seq": seq,
                     "status": status.as_u16(),
                     "response_bytes": body.len(),
-                    "fill_ratio": body.len() as f64 / MAX_BATCH as f64,
+                    "batch_limit_bytes": batch_limit,
+                    "fill_ratio": body.len() as f64 / batch_limit as f64,
                     "queue_wait_us": started.elapsed().as_micros(),
                 }),
             );
@@ -3761,6 +3833,8 @@ async fn create_v2_actor(
     route: &str,
     opts: &ServerOpts,
     permit: tokio::sync::OwnedSemaphorePermit,
+    batch_limit: usize,
+    coalesce_ready: bool,
 ) -> Result<tokio::sync::mpsc::Sender<V2Command>> {
     let target = resolve_route(route, opts).ok_or_else(|| anyhow!("unknown route"))?;
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(CHAN_CAP);
@@ -3775,7 +3849,12 @@ async fn create_v2_actor(
                 let (mut rd, wr) = stream.into_split();
                 let tx = events_tx.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; READ_BUF];
+                    let read_size = if coalesce_ready {
+                        v2_down_payload_capacity(batch_limit)
+                    } else {
+                        READ_BUF
+                    };
+                    let mut buf = vec![0u8; read_size];
                     loop {
                         match rd.read(&mut buf).await {
                             Ok(0) | Err(_) => {
@@ -3842,6 +3921,8 @@ async fn create_v2_actor(
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit,
+            coalesce_ready,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -3857,11 +3938,18 @@ fn create_v2_actor_from_tcp(
     stream: TcpStream,
     permit: tokio::sync::OwnedSemaphorePermit,
     poll_wait: Duration,
+    batch_limit: usize,
+    coalesce_ready: bool,
 ) -> tokio::sync::mpsc::Sender<V2Command> {
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(CHAN_CAP);
     let (mut rd, wr) = stream.into_split();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; READ_BUF];
+        let read_size = if coalesce_ready {
+            v2_down_payload_capacity(batch_limit)
+        } else {
+            READ_BUF
+        };
+        let mut buf = vec![0u8; read_size];
         loop {
             match rd.read(&mut buf).await {
                 Ok(0) | Err(_) => {
@@ -3893,6 +3981,8 @@ fn create_v2_actor_from_tcp(
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit,
+            coalesce_ready,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -3936,11 +4026,31 @@ fn actor_event(actor: &mut V2Actor, event: V2Event) {
     }
 }
 
+fn v2_down_payload_capacity(batch_limit: usize) -> usize {
+    batch_limit.saturating_sub(5 + 8 + 5).max(1)
+}
+
+fn actor_drain_ready(actor: &mut V2Actor) {
+    if !actor.coalesce_ready {
+        return;
+    }
+    while actor.queued_bytes < MAX_V2_QUEUE {
+        match actor.events.try_recv() {
+            Ok(event) => actor_event(actor, event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                actor.eof = true;
+                break;
+            }
+        }
+    }
+}
+
 fn actor_response(actor: &mut V2Actor, seq: u64) -> Bytes {
     let mut out = BytesMut::from(encode_v2_ack(seq).as_ref());
     while let Some(data) = actor.queued.front() {
         let frame = encode_v2_frame(&V2Frame::Data(data.clone()));
-        if out.len() + frame.len() > MAX_BATCH {
+        if out.len() + frame.len() > actor.batch_limit {
             break;
         }
         out.extend_from_slice(&frame);
@@ -3948,7 +4058,7 @@ fn actor_response(actor: &mut V2Actor, seq: u64) -> Bytes {
             actor.queued_bytes = actor.queued_bytes.saturating_sub(5 + sent.len());
         }
     }
-    if actor.eof && out.len() + 5 <= MAX_BATCH {
+    if actor.eof && out.len() + 5 <= actor.batch_limit {
         out.extend_from_slice(&encode_v2_frame(&V2Frame::Close));
     }
     out.freeze()
@@ -3956,6 +4066,7 @@ fn actor_response(actor: &mut V2Actor, seq: u64) -> Bytes {
 
 fn actor_reply_pending(actor: &mut V2Actor) {
     if let Some(pending) = actor.pending.take() {
+        actor_drain_ready(actor);
         let body = actor_response(actor, pending.seq);
         actor.cached_down = Some((pending.seq, body.clone()));
         actor.expected_down = pending.seq + 1;
@@ -3974,6 +4085,10 @@ async fn actor_command(actor: &mut V2Actor, command: V2Command, poll_wait: Durat
         } => {
             if actor.terminal {
                 let _ = reply.send((StatusCode::GONE, Bytes::new()));
+                return;
+            }
+            if raw.len() > actor.batch_limit {
+                let _ = reply.send((StatusCode::PAYLOAD_TOO_LARGE, Bytes::new()));
                 return;
             }
             if let Some((last, last_raw, ack)) = &actor.last_up {
@@ -4110,6 +4225,7 @@ async fn actor_command(actor: &mut V2Actor, command: V2Command, poll_wait: Durat
                     deadline: tokio::time::Instant::now() + jittered_poll_wait(poll_wait),
                 });
             } else {
+                actor_drain_ready(actor);
                 let body = actor_response(actor, seq);
                 actor.cached_down = Some((seq, body.clone()));
                 actor.expected_down += 1;
@@ -4203,6 +4319,7 @@ struct TunnelCtx {
     // infinite by design; a buffering proxy could otherwise hang them forever.
     timeout: Duration,
     retry_window: Duration,
+    experimental_batch_bytes: Option<usize>,
     wire: WireApi,
 }
 
@@ -4360,13 +4477,18 @@ async fn open_tunnel_with_owner(
     let owner_query = owner_id
         .map(|owner| format!("&owner={owner}"))
         .unwrap_or_default();
+    let batch_query = ctx
+        .experimental_batch_bytes
+        .map(|bytes| format!("&batch_bytes={bytes}"))
+        .unwrap_or_default();
     let open_url = format!(
-        "{}{}?s={}&r={}{}",
+        "{}{}?s={}&r={}{}{}",
         ctx.server,
         ctx.wire.open_path(),
         sid,
         target,
         owner_query,
+        batch_query,
     );
     let open = ctx.client.post(&open_url);
     let resp = if matches!(ctx.wire, WireApi::V2 { .. }) {
@@ -4565,10 +4687,13 @@ fn v2_backoff(attempt: u32) -> Duration {
         .min(DOWN_BACKOFF_MAX)
 }
 
-async fn collect_v2_response(resp: reqwest::Response) -> Result<Bytes> {
+async fn collect_v2_response_with_limit(
+    resp: reqwest::Response,
+    batch_limit: usize,
+) -> Result<Bytes> {
     if resp
         .content_length()
-        .map(|len| len as usize > MAX_BATCH)
+        .map(|len| len as usize > batch_limit)
         .unwrap_or(false)
     {
         bail!("v2 response exceeds batch limit");
@@ -4577,7 +4702,7 @@ async fn collect_v2_response(resp: reqwest::Response) -> Result<Bytes> {
     let mut out = BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading v2 response body")?;
-        if out.len().saturating_add(chunk.len()) > MAX_BATCH {
+        if out.len().saturating_add(chunk.len()) > batch_limit {
             bail!("v2 response exceeds batch limit");
         }
         out.extend_from_slice(&chunk);
@@ -4646,6 +4771,10 @@ impl V2RetryWindow {
 }
 
 async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Result<()> {
+    let batch_limit = ctx.experimental_batch_bytes.unwrap_or(MAX_BATCH);
+    if body.len() > batch_limit {
+        bail!("v2 request exceeds configured batch limit");
+    }
     let operation_started = Instant::now();
     let mut retries = V2RetryWindow::new(ctx.retry_window);
     let url = format!(
@@ -4666,7 +4795,7 @@ async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Resul
             .await;
         match result {
             Ok(resp) if resp.status().is_success() => {
-                let bytes = match collect_v2_response(resp).await {
+                let bytes = match collect_v2_response_with_limit(resp, batch_limit).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         if error.to_string().contains("exceeds batch limit") {
@@ -4693,6 +4822,8 @@ async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Resul
                             "sid": sid,
                             "seq": seq,
                             "request_bytes": body.len(),
+                            "batch_limit_bytes": batch_limit,
+                            "fill_ratio": body.len() as f64 / batch_limit as f64,
                             "response_bytes": bytes.len(),
                             "attempts": retries.attempt.saturating_add(1),
                             "ack_wait_us": operation_started.elapsed().as_micros(),
@@ -4750,6 +4881,7 @@ async fn v2_post_ack(ctx: &TunnelCtx, sid: &str, seq: u64, body: Bytes) -> Resul
 }
 
 async fn v2_get_frames(ctx: &TunnelCtx, sid: &str, seq: u64) -> Result<Vec<V2Frame>> {
+    let batch_limit = ctx.experimental_batch_bytes.unwrap_or(MAX_BATCH);
     let operation_started = Instant::now();
     let mut retries = V2RetryWindow::new(ctx.retry_window);
     let url = format!(
@@ -4769,7 +4901,7 @@ async fn v2_get_frames(ctx: &TunnelCtx, sid: &str, seq: u64) -> Result<Vec<V2Fra
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                let bytes = match collect_v2_response(resp).await {
+                let bytes = match collect_v2_response_with_limit(resp, batch_limit).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         if error.to_string().contains("exceeds batch limit") {
@@ -4812,6 +4944,8 @@ async fn v2_get_frames(ctx: &TunnelCtx, sid: &str, seq: u64) -> Result<Vec<V2Fra
                         "sid": sid,
                         "seq": seq,
                         "response_bytes": bytes.len(),
+                        "batch_limit_bytes": batch_limit,
+                        "fill_ratio": bytes.len() as f64 / batch_limit as f64,
                         "frames": frames.len(),
                         "data_bytes": frames.iter().filter_map(|frame| match frame { V2Frame::Data(data) => Some(data.len()), _ => None }).sum::<usize>(),
                         "empty": frames.len() == 1,
@@ -5129,6 +5263,14 @@ fn ctx_from(cfg: &ClientConfig) -> Result<Arc<TunnelCtx>> {
     if matches!(cfg.wire, WireApi::V2 { .. }) && cfg.mode != Mode::Batch {
         bail!("wire api v2 requires batch mode");
     }
+    if let Some(bytes) = cfg.experimental_batch_bytes {
+        if !matches!(cfg.wire, WireApi::V2 { .. }) {
+            bail!("experimental batch size requires wire api v2");
+        }
+        if !EXPERIMENTAL_BATCH_BYTES.contains(&bytes) {
+            bail!("experimental batch size must be 64, 128, or 256 KiB");
+        }
+    }
     Ok(Arc::new(TunnelCtx {
         client: build_client(cfg)?,
         server: cfg.server.trim_end_matches('/').to_owned(),
@@ -5138,6 +5280,7 @@ fn ctx_from(cfg: &ClientConfig) -> Result<Arc<TunnelCtx>> {
         // per-request timeout on the finite requests below.
         timeout: cfg.timeout,
         retry_window: cfg.retry_window,
+        experimental_batch_bytes: cfg.experimental_batch_bytes,
         wire: cfg.wire.clone(),
     }))
 }
@@ -5215,6 +5358,7 @@ pub async fn run_reverse_diagnostic(
     cfg: &ClientConfig,
     endpoint_id: &str,
     run_id: &str,
+    profile: &str,
     passes: u8,
 ) -> Result<()> {
     if !matches!(cfg.wire, WireApi::V2 { .. }) || cfg.mode != Mode::Batch {
@@ -5230,6 +5374,7 @@ pub async fn run_reverse_diagnostic(
     let request = serde_json::json!({
         "endpoint_id": endpoint_id,
         "run_id": run_id,
+        "profile": profile,
         "passes": passes,
     });
     let request_body = serde_json::to_vec(&request)?;
@@ -5752,7 +5897,11 @@ async fn bridge_tcp(tcp: TcpStream, mut sender: TunnelSender, mut receiver: Tunn
     let up_sid = sender.sid.clone();
     let down_sid = up_sid.clone();
     let up = async move {
-        let mut buf = vec![0u8; READ_BUF];
+        let batch_payload = sender
+            .ctx
+            .experimental_batch_bytes
+            .map(|limit| limit.saturating_sub(5).max(1));
+        let mut buf = vec![0u8; batch_payload.unwrap_or(READ_BUF)];
         let mut first = true;
         let clean_eof = loop {
             match rd.read(&mut buf).await {
@@ -5768,8 +5917,46 @@ async fn bridge_tcp(tcp: TcpStream, mut sender: TunnelSender, mut receiver: Tunn
                         }),
                     );
                     first = false;
-                    if let Err(error) = sender.send(Bytes::copy_from_slice(&buf[..n])).await {
+                    let mut ready = n;
+                    let mut eof_after_send = false;
+                    let mut read_failed = false;
+                    if batch_payload.is_some() {
+                        while ready < buf.len() {
+                            match rd.try_read(&mut buf[ready..]) {
+                                Ok(0) => {
+                                    eof_after_send = true;
+                                    break;
+                                }
+                                Ok(m) => {
+                                    diagnostic_event(
+                                        "tcp_read",
+                                        serde_json::json!({
+                                            "sid": up_sid,
+                                            "direction": "up",
+                                            "bytes": m,
+                                            "first": false,
+                                            "coalesced": true,
+                                        }),
+                                    );
+                                    ready += m;
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(error) => {
+                                    log::debug!("TCP mapping local ready-read failed: {error}");
+                                    read_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Err(error) = sender.send(Bytes::copy_from_slice(&buf[..ready])).await {
                         log::debug!("TCP mapping upstream ended: {error}");
+                        break false;
+                    }
+                    if eof_after_send {
+                        break true;
+                    }
+                    if read_failed {
                         break false;
                     }
                 }
@@ -6328,6 +6515,7 @@ mod tests {
             keepalive: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             retry_window: Duration::from_secs(2),
+            experimental_batch_bytes: None,
             wire: WireApi::V2 { token: None },
         };
         v2_post_ack(
@@ -6377,6 +6565,7 @@ mod tests {
             keepalive: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             retry_window: Duration::from_secs(2),
+            experimental_batch_bytes: None,
             wire: WireApi::V2 { token: None },
         };
         for seq in 0..2 {
@@ -6417,6 +6606,7 @@ mod tests {
             keepalive: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             retry_window: Duration::from_secs(2),
+            experimental_batch_bytes: None,
             wire: WireApi::V2 { token: None },
         };
         assert!(v2_post_ack(&ctx, "large", 0, encode_v2_ack(0))
@@ -6455,6 +6645,7 @@ mod tests {
             keepalive: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             retry_window: Duration::from_secs(2),
+            experimental_batch_bytes: None,
             wire: WireApi::V2 { token: None },
         };
         assert!(v2_post_ack(&ctx, "chunked", 0, encode_v2_ack(0))
@@ -6503,6 +6694,8 @@ mod tests {
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit: MAX_BATCH,
+            coalesce_ready: false,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -6578,6 +6771,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_b_drains_only_ready_events_up_to_its_body_limit() {
+        let (events_tx, events) = tokio::sync::mpsc::channel(4);
+        events_tx
+            .send(V2Event::Data(Bytes::from(vec![1; 30 * 1024])))
+            .await
+            .unwrap();
+        events_tx
+            .send(V2Event::Data(Bytes::from(vec![2; 30 * 1024])))
+            .await
+            .unwrap();
+        let mut actor = V2Actor {
+            writer: V2Writer::Echo,
+            events,
+            _event_keepalive: Some(events_tx),
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            expected_up: 0,
+            expected_down: 0,
+            last_up: None,
+            cached_down: None,
+            pending: None,
+            batch_limit: 64 * 1024,
+            coalesce_ready: true,
+            upstream_closed: false,
+            eof: false,
+            terminal: false,
+            _admission: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+        };
+
+        actor_drain_ready(&mut actor);
+        let body = actor_response(&mut actor, 0);
+        assert!(body.len() <= 64 * 1024);
+        assert_eq!(
+            decode_v2_frames(&body).unwrap(),
+            vec![
+                V2Frame::Ack(0),
+                V2Frame::Data(Bytes::from(vec![1; 30 * 1024])),
+                V2Frame::Data(Bytes::from(vec![2; 30 * 1024])),
+            ]
+        );
+        assert_eq!(actor.queued_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn v2_empty_data_frames_count_their_framing_bytes_against_queue_limit() {
         let (keepalive, events) = tokio::sync::mpsc::channel(1);
         let mut actor = V2Actor {
@@ -6591,6 +6830,8 @@ mod tests {
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit: MAX_BATCH,
+            coalesce_ready: false,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -6656,6 +6897,8 @@ mod tests {
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit: MAX_BATCH,
+            coalesce_ready: false,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -6704,6 +6947,7 @@ mod tests {
                 route: "echo".into(),
                 generation: 1,
                 tx,
+                batch_limit: MAX_BATCH,
                 up_inflight: Arc::new(std::sync::Mutex::new(None)),
                 last: Arc::new(std::sync::Mutex::new(Instant::now())),
             },
@@ -6740,6 +6984,8 @@ mod tests {
             last_up: None,
             cached_down: None,
             pending: None,
+            batch_limit: MAX_BATCH,
+            coalesce_ready: false,
             upstream_closed: false,
             eof: false,
             terminal: false,
@@ -6866,6 +7112,7 @@ mod tests {
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             reverse_diagnostics: None,
+            experimental_reverse_batches: false,
         };
 
         let response = handle_down_batch(session, &opts).await;
@@ -6976,6 +7223,7 @@ mod tests {
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             reverse_diagnostics: None,
+            experimental_reverse_batches: false,
         };
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy.local_addr().unwrap().port();
@@ -7040,6 +7288,7 @@ mod tests {
             claims: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             reverse_diagnostics: None,
+            experimental_reverse_batches: false,
         };
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy.local_addr().unwrap().port();

@@ -1,7 +1,8 @@
 # Reverse httptun diagnostics
 
-This package measures the current HTTP/1.1 Batch v2 baseline. It does not enable
-profiles B–F and does not change the v2 wire format.
+This package measures the current HTTP/1.1 Batch v2 baseline and the opt-in
+profile B body-size experiment. Profiles C–F are not enabled, and the baseline
+v2 wire behavior remains the default.
 
 ## What is ready
 
@@ -12,6 +13,10 @@ profiles B–F and does not change the v2 wire format.
   `127.0.0.1:13131`, and both reverse endpoints. It measures the Mac routes and
   asks the VPS to run the application suite through `127.0.0.1:13130`. Mac SSH
   is not used.
+- `run-corp-profile-b.sh` compares baseline A with 64/128/256 KiB profile B.
+  It runs every profile three times in rotated order during one VPN session,
+  leaves the production `probe` endpoint on baseline A, and uses only the
+  isolated `diag` endpoint for the experiment.
 - `windows-edge-corp-profile.ps1` opens an SSH forward and a persistent, separate
   Edge profile. Its PAC sends only `beeline.ru`, `vimpelcom.ru`, and their
   subdomains through reverse httptun; all other hosts use `DIRECT`.
@@ -39,6 +44,18 @@ Run from the unpacked archive:
 ```bash
 ./diagnostics/run-corp-diagnostics.sh
 ```
+
+After the baseline has been accepted, run the A/B size comparison with:
+
+```bash
+./diagnostics/run-corp-profile-b.sh
+```
+
+Profile B is enabled only by `--experimental-batch-kib 64|128|256`. It adds a
+per-session finite-body limit and drains bytes that are already ready without
+waiting to fill the body. The server must also opt in with
+`--experimental-reverse-batches`; omitting either flag uses the unchanged
+baseline path.
 
 Use `--quick` only for troubleshooting. `--trace` attempts an optional 96-byte
 packet capture of encrypted VPS TLS traffic. If passwordless `sudo` is not

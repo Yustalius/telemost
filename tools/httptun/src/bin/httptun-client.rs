@@ -49,6 +49,14 @@ struct Args {
     #[arg(long, default_value_t = 3, requires = "reverse_diagnostic_run")]
     diagnostic_passes: u8,
 
+    /// Profile label embedded in the server-side diagnostic result.
+    #[arg(
+        long,
+        default_value = "A-v2-baseline",
+        requires = "reverse_diagnostic_run"
+    )]
+    diagnostic_profile: String,
+
     /// Add telemost's four port mappings and use this host as the HTTPS server.
     #[arg(long, value_name = "VPS_HOST")]
     telemost_preset: Option<String>,
@@ -93,6 +101,10 @@ struct Args {
     /// Total retry window for one v2 send or receive operation, seconds.
     #[arg(long, default_value_t = 60)]
     retry_window_sec: u64,
+
+    /// Opt-in profile B finite-body limit in KiB: 64, 128, or 256.
+    #[arg(long, value_name = "KIB")]
+    experimental_batch_kib: Option<usize>,
 
     /// -v debug, -vv trace.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -182,6 +194,14 @@ async fn main() -> anyhow::Result<()> {
     if matches!(wire, WireApi::V2 { .. }) && args.mode != Mode::Batch {
         anyhow::bail!("--wire-api v2 requires --mode batch");
     }
+    let experimental_batch_bytes = match args.experimental_batch_kib {
+        Some(kib @ (64 | 128 | 256)) => Some(kib * 1024),
+        Some(_) => anyhow::bail!("--experimental-batch-kib must be 64, 128, or 256"),
+        None => None,
+    };
+    if experimental_batch_bytes.is_some() && args.reverse_mappings.is_empty() {
+        anyhow::bail!("--experimental-batch-kib requires --reverse-map");
+    }
     let cfg = ClientConfig {
         server,
         mode: args.mode,
@@ -190,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         keepalive: Duration::from_secs(args.keepalive_sec.max(1)),
         timeout: Duration::from_secs(args.timeout_sec.max(1)),
         retry_window: Duration::from_secs(args.retry_window_sec.max(1)),
+        experimental_batch_bytes,
         wire,
     };
 
@@ -198,7 +219,14 @@ async fn main() -> anyhow::Result<()> {
             .diagnostic_run_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--diagnostic-run-id is required"))?;
-        run_reverse_diagnostic(&cfg, endpoint, run_id, args.diagnostic_passes).await
+        run_reverse_diagnostic(
+            &cfg,
+            endpoint,
+            run_id,
+            &args.diagnostic_profile,
+            args.diagnostic_passes,
+        )
+        .await
     } else if !args.reverse_mappings.is_empty() {
         run_reverse(
             cfg,
