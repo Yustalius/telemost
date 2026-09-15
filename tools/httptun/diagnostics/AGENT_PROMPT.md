@@ -4,11 +4,11 @@
 
 Репозиторий: `/Users/vyustus/PycharmProjects/telemost`
 
-Prerelease: `httptun-diag-v2-20260915-r1`
+Prerelease: `httptun-diag-v2-20260915-r2`
 
-Mac-пакет: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-r1/httptun-client-macos-aarch64.tar.gz`
+Mac-пакет: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-r2/httptun-client-macos-aarch64.tar.gz`
 
-Контрольная сумма: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-r1/SHA256SUMS`
+Контрольная сумма: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-r2/SHA256SUMS`
 
 Сначала перейди в репозиторий и убедись, что доступны `gh`, `python3`, `curl`, `lsof`, Cisco VPN, Kerberos и локальный `px`. Скачай ровно два указанных release asset во временный каталог, проверь строку только для `httptun-client-macos-aarch64.tar.gz` через `shasum -a 256 -c`, распакуй архив и запускай скрипты из распакованного пакета. Не используй непроверенный локальный build вместо release asset. Готовые команды:
 
@@ -20,7 +20,7 @@ HTTP_PROXY=http://127.0.0.1:3129 \
 HTTPS_PROXY=http://127.0.0.1:3129 \
 ALL_PROXY=http://127.0.0.1:3129 \
 NO_PROXY=127.0.0.1,localhost \
-gh release download httptun-diag-v2-20260915-r1 \
+gh release download httptun-diag-v2-20260915-r2 \
   --repo Yustalius/telemost \
   --dir "$DIAG_DOWNLOAD_DIR" \
   --pattern httptun-client-macos-aarch64.tar.gz \
