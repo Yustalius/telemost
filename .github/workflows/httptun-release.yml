@@ -1,9 +1,6 @@
 name: Build standalone httptun
 
 on:
-  push:
-    branches:
-      - codex/httptun-reverse
   workflow_dispatch:
     inputs:
       upload-artifact:
@@ -46,12 +43,12 @@ jobs:
       - name: Build Linux x86_64 server
         run: cargo build -p httptun --bin httptun-server --release --locked
       - name: Package Linux server
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         run: |
           strip target/release/httptun-server
           tar -C target/release -czf httptun-server-linux-x86_64.tar.gz httptun-server
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         with:
           name: httptun-server-linux-x86_64
           path: httptun-server-linux-x86_64.tar.gz
@@ -75,12 +72,12 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "12.3"
         run: cargo build -p httptun --bin httptun-client --release --locked --target aarch64-apple-darwin
       - name: Package macOS client
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         run: |
           strip target/aarch64-apple-darwin/release/httptun-client
           tar -C target/aarch64-apple-darwin/release -czf httptun-client-macos-aarch64.tar.gz httptun-client
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         with:
           name: httptun-client-macos-aarch64
           path: httptun-client-macos-aarch64.tar.gz
@@ -101,7 +98,7 @@ jobs:
       - name: Build Windows x64 client
         run: cargo build -p httptun --bin httptun-client --release --locked
       - name: Package Windows client and SSH helper
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path package
@@ -109,7 +106,7 @@ jobs:
           Copy-Item tools/httptun/windows-ssh-forward.ps1 package/
           Compress-Archive -Path package/* -DestinationPath httptun-client-windows-x86_64.zip
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+        if: ${{ inputs.upload-artifact }}
         with:
           name: httptun-client-windows-x86_64
           path: httptun-client-windows-x86_64.zip
@@ -118,7 +115,7 @@ jobs:
 
   release:
     needs: [linux-server, macos-client, windows-client]
-    if: ${{ github.event_name == 'push' || inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -132,7 +129,7 @@ jobs:
       - name: Publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event_name == 'push' && 'manual-httptun-reverse-20260915' || inputs.upload-tag }}
+          RELEASE_TAG: ${{ inputs.upload-tag }}
         run: |
           gh release create "$RELEASE_TAG" \
             release/httptun-*.tar.gz \

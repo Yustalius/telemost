@@ -32,15 +32,25 @@ ok() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
 warn() { printf '  \033[33m!!\033[0m  %s\n' "$*"; }
 info() { printf '  \033[36m..\033[0m  %s\n' "$*"; }
 die() { printf '  \033[31mxx\033[0m  %s\n' "$*"; exit 1; }
+usage() {
+    printf '%s\n' \
+        "Использование: $0 [start|--status|--stop|--diagnostic] [--force]" \
+        "  start / без аргументов  проверить окружение и запустить reverse httptun" \
+        "  --status              показать состояние px, клиента и VPS bind" \
+        "  --stop                остановить только httptun-client" \
+        "  --diagnostic          запустить с подробным логом" \
+        "  --force               продолжить при неясном VPN/Kerberos или precheck"
+}
 
 for arg in "$@"; do
     case "$arg" in
+        start) ACTION=start ;;
         --stop) ACTION=stop ;;
         --status) ACTION=status ;;
         --diagnostic | --diagnostic-log) DIAGNOSTIC=1 ;;
         --force) FORCE=1 ;;
         --help | -h)
-            sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+            usage
             exit 0
             ;;
         *) die "неизвестный аргумент: $arg (см. --help)" ;;
