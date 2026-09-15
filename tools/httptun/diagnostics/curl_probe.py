@@ -58,7 +58,7 @@ def main() -> None:
             "no_proxy",
         ):
             environment.pop(name, None)
-        command.extend(["--proxy", "", f"--noproxy={args.noproxy}"])
+        command.extend(["--proxy", "", "--noproxy", args.noproxy])
     else:
         if not args.proxy:
             parser.error("--proxy is required in proxy mode")
@@ -79,6 +79,11 @@ def main() -> None:
         metrics = {}
     code = int(metrics.get("http_code") or 0)
     ok = completed.returncode == 0 and code not in {0, 407, 502}
+    error = None
+    if completed.returncode != 0:
+        error = f"curl_exit_{completed.returncode}"
+    elif code in {0, 407, 502}:
+        error = f"http_{code}"
     if not args.warmup:
         record = {
             "segment": args.segment,
@@ -97,6 +102,7 @@ def main() -> None:
             "speed_download": round(float(metrics.get("speed_download") or 0), 3),
             "num_connects": int(metrics.get("num_connects") or 0),
             "num_redirects": int(metrics.get("num_redirects") or 0),
+            "error": error,
         }
         append_jsonl(args.measurements, record)
         effective = urlsplit(metrics.get("url_effective") or args.url)

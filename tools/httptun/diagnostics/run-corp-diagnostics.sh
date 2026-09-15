@@ -150,9 +150,14 @@ printf 'unix_ms,cpu_percent,rss_kib,threads\n' >"$RESULT_DIR/mac-resources.csv"
 (
     while kill -0 "$CLIENT_PID" 2>/dev/null; do
         now=$(date '+%s000')
-        ps -p "$CLIENT_PID" -o %cpu= -o rss= -o thcount= 2>/dev/null \
-            | awk -v now="$now" '{print now "," $1 "," $2 "," $3}' \
-            >>"$RESULT_DIR/mac-resources.csv"
+        stats=$(LC_ALL=C ps -p "$CLIENT_PID" -o %cpu= -o rss= 2>/dev/null \
+            | awk 'NF >= 2 { print $1 "," $2; exit }')
+        if [ -n "$stats" ]; then
+            threads=$(ps -M -p "$CLIENT_PID" 2>/dev/null \
+                | awk 'NR > 1 { count++ } END { print count + 0 }')
+            printf '%s,%s,%s\n' "$now" "$stats" "$threads" \
+                >>"$RESULT_DIR/mac-resources.csv"
+        fi
         sleep 1
     done
 ) &

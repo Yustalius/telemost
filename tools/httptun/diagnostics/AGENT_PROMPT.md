@@ -15,6 +15,11 @@ Mac-пакет: `https://github.com/Yustalius/telemost/releases/download/httptun
 ```bash
 cd /Users/vyustus/PycharmProjects/telemost
 DIAG_DOWNLOAD_DIR=$(mktemp -d /tmp/httptun-corp-diag.XXXXXX)
+env -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+HTTP_PROXY=http://127.0.0.1:3129 \
+HTTPS_PROXY=http://127.0.0.1:3129 \
+ALL_PROXY=http://127.0.0.1:3129 \
+NO_PROXY=127.0.0.1,localhost \
 gh release download httptun-diag-v2-20260915-r1 \
   --repo Yustalius/telemost \
   --dir "$DIAG_DOWNLOAD_DIR" \
