@@ -9,32 +9,31 @@
 
 Prerelease: `httptun-diag-v2-20260915-b1`
 
+Проверенный Mac-пакет уже подготовлен локально:
+
+`/Users/vyustus/.telemost-vpn/releases/httptun-diag-v2-20260915-b1-f85b0bd28`
+
+SHA-256 бинарника `httptun-client`:
+`c8d2b47c5eeb88d6fcc36d587be9b5d73c1dbf9e4e4c078b10455e3eb9d15bca`.
+
 Mac-пакет: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-b1/httptun-client-macos-aarch64.tar.gz`
 
 Контрольная сумма: `https://github.com/Yustalius/telemost/releases/download/httptun-diag-v2-20260915-b1/SHA256SUMS`
 
-Скачай только опубликованный пакет и checksum через уже выделенный proxy 3129,
-проверь архив и распакуй его:
+Сначала используй уже подготовленный пакет — GitHub и повторная загрузка для
+основного сценария не нужны:
 
 ```bash
-cd /Users/vyustus/PycharmProjects/telemost
-COMPARE_DOWNLOAD_DIR=$(mktemp -d /tmp/httptun-corp-ab.XXXXXX)
-env -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
-HTTP_PROXY=http://127.0.0.1:3129 \
-HTTPS_PROXY=http://127.0.0.1:3129 \
-ALL_PROXY=http://127.0.0.1:3129 \
-NO_PROXY=127.0.0.1,localhost \
-gh release download httptun-diag-v2-20260915-b1 \
-  --repo Yustalius/telemost \
-  --dir "$COMPARE_DOWNLOAD_DIR" \
-  --pattern httptun-client-macos-aarch64.tar.gz \
-  --pattern SHA256SUMS
-cd "$COMPARE_DOWNLOAD_DIR"
-grep '  httptun-client-macos-aarch64.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-mkdir package
-tar -xzf httptun-client-macos-aarch64.tar.gz -C package
-cd package
+PACKAGE_DIR=/Users/vyustus/.telemost-vpn/releases/httptun-diag-v2-20260915-b1-f85b0bd28
+cd "$PACKAGE_DIR"
+test "$(shasum -a 256 httptun-client | awk '{print $1}')" = \
+  c8d2b47c5eeb88d6fcc36d587be9b5d73c1dbf9e4e4c078b10455e3eb9d15bca
+test -x diagnostics/run-corp-profile-b.sh
 ```
+
+Только если локального пакета нет или checksum не совпал, скачай заново
+опубликованный Mac-пакет и `SHA256SUMS` по указанным выше URL через dedicated
+proxy `127.0.0.1:3129`, затем проверь архив до распаковки.
 
 До запуска проверь `klist`, Cisco VPN и `./httptun-corp-launch.sh --status`.
 Если 3129 уже занят подходящим dedicated `px`, не останавливай его. Запусти:
