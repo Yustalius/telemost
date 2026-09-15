@@ -130,11 +130,15 @@ jobs:
         working-directory: release
         run: sha256sum httptun-*.tar.gz httptun-*.zip > SHA256SUMS
       - name: Publish prerelease
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        with:
-          prerelease: true
-          tag_name: ${{ github.event_name == 'push' && 'manual-httptun-reverse-20260915' || inputs.upload-tag }}
-          files: |
-            release/httptun-*.tar.gz
-            release/httptun-*.zip
-            release/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && 'manual-httptun-reverse-20260915' || inputs.upload-tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            release/httptun-*.tar.gz \
+            release/httptun-*.zip \
+            release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --prerelease
